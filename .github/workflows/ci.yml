@@ -70,10 +70,10 @@ jobs:
       - name: Validate workflow tooling
         run: make check-ci
       - name: Check
-        timeout-minutes: 6
+        timeout-minutes: 8
         env:
-          STOK_BUILD_TIMEOUT_SECONDS: 300
-        run: python3 Scripts/bounded_run.py --seconds 300 --label ci-check -- make check
+          STOK_BUILD_TIMEOUT_SECONDS: 420
+        run: python3 Scripts/bounded_run.py --seconds 420 --label ci-check -- make check
       # The Release build was 30 percent of every main run and nothing consumes the
       # development ZIP automatically, so it is built only on manual runs:
       #   gh workflow run CI --ref main

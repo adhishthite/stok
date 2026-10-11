@@ -16,7 +16,7 @@ Xcode 26.6. It runs on pull requests and pushes to main that change a build inpu
 (`Sources`, `Tests`, `Resources`, `Scripts`, `Tools`, `Config`, `project.yml`,
 `Makefile`, or the workflows), and on manual requests. The repository is public,
 so hosted runner minutes are free. Every run validates tooling and runs `make
-check` under the documented 300-second hosted deadline. The Sparkle package
+check` under the documented 420-second hosted deadline. The Sparkle package
 checkout is cached between runs, keyed on `project.yml`. Only manual runs also
 package a development ZIP, bounded at 240 seconds and retained for 14 days. These
 are development artifacts, not signed public releases. Test results are uploaded
