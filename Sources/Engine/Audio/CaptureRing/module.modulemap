@@ -1,0 +1,4 @@
+module StokCaptureRing {
+  header "StokCaptureRing.h"
+  export *
+}

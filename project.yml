@@ -1,0 +1,165 @@
+name: Stok
+options:
+  minimumXcodeGenVersion: 2.46.0
+  deploymentTarget:
+    macOS: '14.0'
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.6
+settings:
+  base:
+    SWIFT_VERSION: '6.0'
+    SWIFT_STRICT_CONCURRENCY: complete
+    MACOSX_DEPLOYMENT_TARGET: '14.0'
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: '-'
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_APP_SANDBOX: NO
+    ENABLE_DEBUG_DYLIB: NO
+    MARKETING_VERSION: '0.1.9'
+    CURRENT_PROJECT_VERSION: '16'
+    STOK_UPDATE_FEED_URL: 'https://github.com/adhishthite/stok/releases/latest/download/appcast.xml'
+    STOK_SOURCE_REVISION: unversioned
+    # C module for the lock-free capture ring (C11 atomics; macOS 14 has no Swift atomics).
+    SWIFT_INCLUDE_PATHS: $(inherited) $(SRCROOT)/Sources/Engine/Audio/CaptureRing
+targets:
+  StokSettingsReference:
+    type: tool
+    platform: macOS
+    sources: Tools/SettingsReference.swift
+    dependencies:
+      - target: StokEngine
+      - sdk: libsqlite3.tbd
+  StokHarness:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Tools/Harness
+        excludes:
+          - "*.json"
+    dependencies:
+      - target: StokEngine
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        # Local measurement tool, never distributed. Under the hardened runtime a
+        # process needs the audio-input entitlement to open the microphone.
+        ENABLE_HARDENED_RUNTIME: NO
+        SWIFT_VERSION: '5.0'
+        SWIFT_STRICT_CONCURRENCY: minimal
+  StokEngine:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: Sources/Engine
+        # Found through SWIFT_INCLUDE_PATHS; a copied module map would shadow it.
+        excludes:
+          - "Audio/CaptureRing/*.h"
+          - "Audio/CaptureRing/module.modulemap"
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEFINES_MODULE: YES
+        PRODUCT_MODULE_NAME: StokEngine
+  StokHUD:
+    type: library.static
+    platform: macOS
+    sources: Sources/HUD
+    dependencies:
+      - target: StokEngine
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        SWIFT_STRICT_CONCURRENCY: minimal
+        DEFINES_MODULE: YES
+  Stok:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/App
+      - Sources/UI
+      - Sources/Store
+      - Sources/Support
+      - path: Resources
+        buildPhase: resources
+      - path: PRIVACY.md
+        buildPhase: resources
+    dependencies:
+      - target: StokEngine
+      - target: StokHUD
+      - package: Sparkle
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.adhishthite.stok
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_ENTITLEMENTS: Config/Stok.entitlements
+        INFOPLIST_FILE: Config/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+  StokTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: Tests/AppTests
+    dependencies:
+      - target: Stok
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.adhishthite.stok.tests
+        GENERATE_INFOPLIST_FILE: YES
+  StokHUDTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: Tests/HUDTests
+    dependencies:
+      - target: Stok
+      - target: StokHUD
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        SWIFT_STRICT_CONCURRENCY: minimal
+        PRODUCT_BUNDLE_IDENTIFIER: com.adhishthite.stok.hud-tests
+        GENERATE_INFOPLIST_FILE: YES
+  StokEngineTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources: Tests/EngineTests
+    dependencies:
+      - target: StokEngine
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        SWIFT_VERSION: '5.0'
+        SWIFT_STRICT_CONCURRENCY: minimal
+        PRODUCT_BUNDLE_IDENTIFIER: com.adhishthite.stok.engine-tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  StokSettingsReference:
+    build:
+      targets:
+        StokSettingsReference: all
+  StokHarness:
+    build:
+      targets:
+        StokHarness: all
+  StokLiveChecks:
+    build:
+      targets:
+        StokEngine: all
+    test:
+      targets:
+        - StokEngineTests
+      environmentVariables:
+        STOK_LIVE_TESTS: '1'
+        STOK_PROJECT_ROOT: $(SRCROOT)
+  Stok:
+    build:
+      targets:
+        Stok: all
+    test:
+      gatherCoverageData: true
+      targets:
+        - StokTests
+        - StokEngineTests
+        - StokHUDTests

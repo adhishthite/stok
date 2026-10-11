@@ -1,0 +1,1138 @@
+// Copyright 2026 Adhish Thite
+// SPDX-License-Identifier: Apache-2.0
+
+import AVFoundation
+import AppKit
+import AudioToolbox
+import Carbon
+import CoreAudio
+import Foundation
+import IOKit
+import Network
+import SQLite3
+import StokCaptureRing
+
+final class AudioCaptureEngine {
+  let audioEngine = AVAudioEngine()
+  private var audioConverter: AVAudioConverter?
+  private let targetFormat: AVAudioFormat
+
+  // Dedicated background audio processing queue (keeps CoreAudio render thread non-blocking)
+  let audioProcessingQueue = DispatchQueue(
+    label: "com.adhishthite.stok.audioProcessing", qos: .userInteractive)
+
+  // IO-cycle capture. The sink node runs on the CoreAudio IO thread once per hardware cycle
+  // (about 10 ms) and only copies the buffer list into `ring`: no lock, no allocation, no
+  // Swift reference counting. A waker thread blocks on the ring's semaphore and drains it
+  // synchronously on audioProcessingQueue, where conversion and everything else happens. The old
+  // input tap delivered 100 ms buffers regardless of the requested size, so readiness
+  // waited for a full 100 ms buffer and every downstream timer saw 100 ms steps.
+  // 1 MiB holds about 5 s of mono 48 kHz Float32: far more than any processing stall
+  // that should not interrupt a turn anyway.
+  let ring = CaptureRing(capacityBytes: 1 << 20)
+  private lazy var sinkNode: AVAudioSinkNode = {
+    let producer = ring.pointer
+    return AVAudioSinkNode { timestamp, frameCount, bufferList in
+      _ = CaptureRing.write(producer, bufferList, frames: frameCount, timestamp: timestamp)
+      return noErr
+    }
+  }()
+  // Hardware queue only.
+  private var sinkConnected = false
+  private var wakerStarted = false
+  // audioProcessingQueue only.
+  private var ringScratch: AVAudioPCMBuffer?
+  private var ringGeneration: UInt64 = 0
+  private var ringDroppedSeen: UInt64 = 0
+
+  /// Hardware cycle the capture asks for when the device's own cycle is longer than
+  /// `maximumIOBufferSec`.
+  static let targetIOBufferSec = 0.010
+  static let maximumIOBufferSec = 0.020
+
+  let lock = NSLock()
+  var isRecording: Bool = false
+  var isEngineRunning: Bool { lifecycle.healthy }
+  private var notificationObservers: [NSObjectProtocol] = []
+  private var bufferEpoch: UInt64 = 0
+  var turnInterrupted = false
+  private var interruptionNotified = false
+  // Buffer health goes straight to the lifecycle's own queue. It used to hop through main,
+  // so a main-thread stall of about a second aged every buffer past the recovery
+  // controller's 0.75 s freshness window: a live hold was interrupted with "Microphone
+  // stopped delivering audio" and the hardware was rebuilt while audio was still flowing.
+  // Internal, not private, so a test can assert the delivery target stays off main.
+  lazy var healthDelivery = QueueDelivery<(UInt64, TimeInterval)>(queue: lifecycle.queue) {
+    [weak self] value in
+    self?.lifecycle.receivedBufferOnQueue(generation: value.0, at: value.1)
+  }
+  private lazy var overloadDelivery = MainQueueDelivery<UInt64> { [weak self] epoch in
+    guard let self else { return }
+    self.lock.lock()
+    let current = self.bufferEpoch == epoch && self.turnInterrupted
+    self.lock.unlock()
+    if current { self.interruptCapture("Microphone audio processing could not keep up") }
+  }
+  var onCaptureInterrupted: ((String) -> Void)?
+  lazy var lifecycle = MicrophoneLifecycle(
+    rebuild: { [weak self] in self?.rebuildHardware() ?? false },
+    stop: { [weak self] in self?.stopHardware() },
+    running: { [weak self] in self?.audioEngine.isRunning ?? false },
+    interrupted: { [weak self] reason in self?.interruptCapture(reason) }
+  )
+  var recordedPCMData = Data()
+  private var chunkCount: Int = 0
+  var recordingStartTime: CFAbsoluteTime = 0
+  private var lastMeterUpdateTime: CFAbsoluteTime = 0
+  // Latest RMS level while recording, polled by stopRecording's adaptive trailing-capture
+  // wait; updated on every buffer (not just the 10Hz meter throttle) so the poll sees a
+  // fresh reading.
+  private var lastLevelDb: Double = -120.0
+  private var lastLevelTime: CFAbsoluteTime = 0
+
+  // Pre-roll rolling ring buffer (default 400ms = 6400 samples @ 16kHz = 12800 bytes)
+  private var preRollRingBuffer = Data()
+  private let maxPreRollBytes: Int
+  private var preRollBytesInTurn = 0
+  // Count of frameDbValues entries contributed by pre-roll audio at the start of this turn
+  // (onset_db excludes them). Set once, right after the pre-roll folds into the
+  // stats accumulator in startRecordingOnQueue, under `lock` like preRollBytesInTurn.
+  private var preRollFrameCountInTurn = 0
+
+  // Streaming chunk accumulator (CHUNK_MS; default 100ms = 3200 bytes, the size the
+  // dedicated transcribe model's docs suggest)
+  private var pendingChunkBuffer = Data()
+  private let streamingChunkTargetBytes: Int
+
+  // Synthetic trailing silence appended at stopRecording (SILENCE_FLUSH_MS; 0 disables)
+  private let silenceFlushBytes: Int
+
+  // Silence-gate statistics, accumulated inline as audio arrives so stopRecording never
+  // rescans the whole clip on the key-up critical path. Framing is continuous across
+  // chunks AND across the pre-roll/live boundary, matching the old whole-clip scan
+  // exactly. All under `lock`; per-frame dB values are classified against the caller's
+  // threshold at stopRecording time (the threshold is a stopRecording argument).
+  private static let speechFrameSamples = 320  // 20ms of 16kHz mono
+  // Post-roll poll step. 10ms, not 25ms: the old step quantized the exit of an
+  // already-banked turn to about 75ms against a 60ms floor (measured minimum 77ms).
+  private static let postRollPollSec: Double = 0.010
+  var turnMaxAbsSample: Int32 = 0
+  private var frameSumSquares: Double = 0
+  private var frameSampleCount: Int = 0
+  var frameDbValues: [Double] = []
+  var statSampleCount: Int = 0
+
+  var onAudioChunk: ((Data) -> Void)?
+  var onAudioLevel: ((Double) -> Void)?
+  // Measurement hook for MicrophoneProbe: hardware frames, hardware sample rate, the uptime
+  // at which the IO thread delivered the buffer, and the uptime CoreAudio stamped on its
+  // first frame (nil when not valid). Runs on audioProcessingQueue. Set it before setup; it
+  // is never changed while hardware runs.
+  var onHardwareBuffer: ((Int, Double, TimeInterval, TimeInterval?) -> Void)?
+
+  // Milliseconds of pre-roll audio actually prepended to the turn now finishing (0
+  // when pre-roll was off or the mic was cold). Snapshot under `lock`, then compute outside
+  // it - no I/O or callbacks here, just arithmetic on the copy.
+  var preRollMsUsedInTurn: Double {
+    lock.lock()
+    let bytes = preRollBytesInTurn
+    lock.unlock()
+    return Double(bytes) / 32.0
+  }
+
+  // First-word-clipping proxy - the loudest of the first five 20ms frames of
+  // NEWLY captured audio after capture start, excluding pre-roll. NULL (nil) if the clip has
+  // no post-pre-roll frames at all. Snapshot under `lock`, compute outside it.
+  var onsetDbInTurn: Double? {
+    lock.lock()
+    let frames = frameDbValues
+    let preRollFrames = preRollFrameCountInTurn
+    lock.unlock()
+    return Self.onsetDb(frames: frames, preRollFrameCount: preRollFrames)
+  }
+
+  /// Pure function backing `onsetDbInTurn`, tested directly: the max of up to the first five
+  /// frames at and after `preRollFrameCount`, or nil if none exist.
+  static func onsetDb(frames: [Double], preRollFrameCount: Int) -> Double? {
+    let start = max(0, preRollFrameCount)
+    guard start < frames.count else { return nil }
+    let end = min(frames.count, start + 5)
+    return frames[start..<end].max()
+  }
+
+  /// Pure function backing CaptureFinalizeStats.noiseFloorDb, tested directly. 10th
+  /// percentile (linear interpolation between the two closest ranks) of every per-20ms-frame
+  /// dB value in the clip. nil if fewer than 10 frames exist - too little signal for a
+  /// percentile to mean anything.
+  /// Speech keeps at least this much headroom above the adaptive quiet line.
+  static let quietSpeechHeadroomDb = 12.0
+
+  /// The level below which the trailing-capture wait counts audio as quiet. In a quiet room
+  /// it is the configured threshold. In a room whose own level reaches that threshold, the
+  /// fixed line would read room tone as speech and hold every turn to the cap, so the line
+  /// rises to the turn's room floor (10th percentile of its 20 ms frames: pauses between
+  /// words fall to room level) plus `marginDb`, but never closer than
+  /// `quietSpeechHeadroomDb` to the turn's speech level (90th percentile), so words are never
+  /// read as quiet. Too few frames to estimate either, or a zero margin, keeps the
+  /// configured threshold. It governs only the wait after release; quiet banked before
+  /// release is always judged against the configured threshold.
+  static func quietThresholdDb(frames: [Double], configuredDb: Double, marginDb: Double)
+    -> Double
+  {
+    guard marginDb > 0, frames.count >= 10 else { return configuredDb }
+    let sorted = frames.sorted()
+    let floor = percentile(sorted: sorted, 0.10)
+    let speech = percentile(sorted: sorted, 0.90)
+    return max(configuredDb, min(floor + marginDb, speech - quietSpeechHeadroomDb))
+  }
+
+  private static func percentile(sorted: [Double], _ fraction: Double) -> Double {
+    let rank = fraction * Double(sorted.count - 1)
+    let lowerIndex = Int(rank)
+    let upperIndex = min(lowerIndex + 1, sorted.count - 1)
+    return sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex])
+      * (rank - Double(lowerIndex))
+  }
+
+  static func noiseFloorDb(frames: [Double]) -> Double? {
+    guard frames.count >= 10 else { return nil }
+    let sorted = frames.sorted()
+    let rank = 0.10 * Double(sorted.count - 1)
+    let lowerIndex = Int(rank)
+    let upperIndex = min(lowerIndex + 1, sorted.count - 1)
+    let fraction = rank - Double(lowerIndex)
+    return sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex]) * fraction
+  }
+
+  /// Pure function classifying why the adaptive trailing-capture loop just broke
+  /// (called only at the instant `postRollWakeDelay` returns <= 0 for the same arguments, so
+  /// it mirrors that function's own branching rather than re-deciding anything). `quietIsStale`
+  /// is whether the iteration that made quiet win was a stale level reading rather than a
+  /// genuine below-threshold one; it only changes the result when quiet (not cap) wins.
+  static func trailExitReason(
+    now: TimeInterval, entryTime: TimeInterval, quietStart: TimeInterval?, graceSec: Double,
+    minTrailSec: Double, maxTrailSec: Double, quietIsStale: Bool
+  ) -> String {
+    if entryTime + maxTrailSec - now <= 0 { return "cap" }
+    if let quietStart = quietStart, quietStart + graceSec - now <= 0,
+      entryTime + minTrailSec - now <= 0
+    {
+      return quietIsStale ? "quiet_stale" : "quiet"
+    }
+    // Unreachable when called only at a genuine break (see postRollWakeDelay: those are the
+    // only two conditions under which it returns <= 0), kept as an honest default rather than
+    // one that claims a quiet exit that was not actually satisfied.
+    return "cap"
+  }
+
+  // Device metadata is written on the hardware queue and read through a locked snapshot.
+  private var inputSnapshot: InputDeviceCatalog.Device?
+  var currentInput: InputDeviceCatalog.Device? {
+    lock.lock()
+    defer { lock.unlock() }
+    return inputSnapshot
+  }
+  private let preferredInputDevice: String
+  private var autoInput: Bool { preferredInputDevice.lowercased() == "auto" }
+  // Hardware-queue-only: a lid flip arrived mid-dictation; re-pin once the turn is over.
+  private var pendingReselect = false
+
+  init(
+    preRollMs: Int = 400, chunkMs: Int = 100, silenceFlushMs: Int = 200, inputDevice: String = ""
+  ) {
+    self.preferredInputDevice = inputDevice
+    // Standard 16kHz 16-bit Mono Linear PCM for speech AI models
+    self.targetFormat = AVAudioFormat(
+      commonFormat: .pcmFormatInt16,
+      sampleRate: 16000.0,
+      channels: 1,
+      interleaved: true
+    )!
+    // 16,000 samples/sec * 2 bytes/sample = 32 bytes per ms
+    self.maxPreRollBytes = max(0, preRollMs * 32)
+    self.streamingChunkTargetBytes = max(640, chunkMs * 32)
+    self.silenceFlushBytes = max(0, silenceFlushMs * 32)
+  }
+
+  func setup(startImmediately: Bool = true) -> Bool {
+    // Initialize lazy delivery/state objects before hardware work can access them.
+    _ = lifecycle
+    _ = healthDelivery
+    _ = overloadDelivery
+    // Device changes (AirPods connect/disconnect, default-input switch) invalidate both
+    // the tap's captured format and the converter; AVAudioEngine posts this after
+    // reconfiguring itself. Forward notifications to the serialized hardware lifecycle.
+    notificationObservers.append(
+      NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: audioEngine, queue: .main
+      ) { [weak self] _ in
+        self?.handleConfigurationChange()
+      })
+    // A lid open/close with an external display attached always reshuffles the screen
+    // list; that's the trigger for INPUT_DEVICE=auto (the HAL itself often stays quiet).
+    if autoInput {
+      notificationObservers.append(
+        NotificationCenter.default.addObserver(
+          forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          self?.reselectForLidState()
+        })
+    }
+
+    if startImmediately { lifecycle.start() }
+    return true
+  }
+
+  deinit {
+    for observer in notificationObservers { NotificationCenter.default.removeObserver(observer) }
+    // Stop IO before the waker can release the last other reference to the ring, so the
+    // sink block never writes into freed storage. Normal shutdown already stopped it.
+    audioEngine.stop()
+    // The waker holds self weakly; wake it so it sees self is gone and exits.
+    ring.wake()
+    emptyList.deallocate()
+  }
+
+  // Hardware queue only. One waker thread per capture engine, started with the first
+  // hardware build and ended by deinit's wake. It drains synchronously on
+  // audioProcessingQueue: the drain runs on this already-awake thread, with no queue hop and
+  // no second thread wake per hardware cycle. Nothing on audioProcessingQueue waits for this
+  // thread, so the sync cannot deadlock.
+  private func startWakerIfNeeded() {
+    guard !wakerStarted else { return }
+    wakerStarted = true
+    let ring = self.ring
+    let thread = Thread { [weak self] in
+      while true {
+        ring.wait()
+        guard let self else { return }
+        self.audioProcessingQueue.sync { self.drainRingOnQueue() }
+      }
+    }
+    thread.name = "com.adhishthite.stok.captureWaker"
+    thread.qualityOfService = .userInteractive
+    thread.start()
+  }
+
+  /// audioProcessingQueue only. Moves every published hardware buffer through conversion in
+  /// arrival order. Callers that need all audio delivered so far (start, stop, finish) call
+  /// it directly instead of waiting for the waker.
+  func drainRingOnQueue() {
+    dispatchPrecondition(condition: .onQueue(audioProcessingQueue))
+    noteRingDrops()
+    // Checked again after the loop: the IO thread keeps writing while this drain runs, and
+    // the stop path closes the recording gate right after its final drain. A loss in that
+    // window must still mark the finishing turn, not the idle time after it.
+    defer { noteRingDrops() }
+    let epoch = ring.epoch
+    while let next = ring.peek() {
+      guard next.epoch == epoch, let format = audioConverter?.inputFormat else {
+        _ = ring.read(into: emptyList)
+        continue
+      }
+      let reusable = ringScratch.map { $0.format == format && $0.frameCapacity >= next.frames }
+      if reusable != true {
+        // Off the IO thread; allocated once per format, or when a cycle outgrows it.
+        ringScratch = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: max(next.frames, 4096))
+      }
+      guard let scratch = ringScratch else {
+        _ = ring.read(into: emptyList)
+        discardFailedBuffer()
+        continue
+      }
+      // AVAudioPCMBuffer derives each mDataByteSize from frameLength when the list is
+      // fetched, so open the full capacity first and use one fetched pointer throughout.
+      scratch.frameLength = scratch.frameCapacity
+      let abl = scratch.mutableAudioBufferList
+      let (status, info) = ring.read(into: abl)
+      let expectedBytes = info.frames * format.streamDescription.pointee.mBytesPerFrame
+      guard status == StokCaptureReadOK,
+        UnsafeMutableAudioBufferListPointer(abl).allSatisfy({ $0.mDataByteSize == expectedBytes })
+      else {
+        discardFailedBuffer()
+        continue
+      }
+      scratch.frameLength = info.frames
+      let capturedAt = CaptureRing.uptime(hostTime: info.hostTime)
+      onHardwareBuffer?(
+        Int(info.frames), format.sampleRate, capturedAt,
+        info.inputHostTime == 0 ? nil : CaptureRing.uptime(hostTime: info.inputHostTime))
+      processIncomingBufferOnQueue(
+        scratch, generation: ringGeneration, capturedAt: capturedAt, healthDelivery: healthDelivery)
+    }
+  }
+
+  /// audioProcessingQueue only. A full ring lost hardware audio, exactly like the old tap's
+  /// queue limit: a live turn is interrupted.
+  private func noteRingDrops() {
+    let dropped = ring.dropped
+    guard dropped != ringDroppedSeen else { return }
+    ringDroppedSeen = dropped
+    discardFailedBuffer()
+  }
+
+  // A zero-buffer list: reading into it consumes and drops one record.
+  private let emptyList: UnsafeMutablePointer<AudioBufferList> = {
+    let list = UnsafeMutablePointer<AudioBufferList>.allocate(capacity: 1)
+    list.initialize(to: AudioBufferList())
+    list.pointee.mNumberBuffers = 0
+    return list
+  }()
+
+  /// Frames to request for the hardware IO cycle, or nil to leave the device as it is.
+  /// Only a cycle longer than `maximumIOBufferSec` is shortened, to `targetIOBufferSec`
+  /// clamped to what the device allows. A short cycle is never lengthened.
+  static func ioBufferFrames(
+    current: UInt32, sampleRate: Double, range: ClosedRange<Double>?
+  ) -> UInt32? {
+    guard sampleRate.isFinite, sampleRate > 0, current > 0 else { return nil }
+    guard Double(current) / sampleRate > maximumIOBufferSec else { return nil }
+    var target = (sampleRate * targetIOBufferSec).rounded()
+    if let range { target = min(max(target, range.lowerBound), range.upperBound) }
+    let frames = UInt32(target)
+    return frames > 0 && frames < current ? frames : nil
+  }
+
+  // Hardware queue only. Reads the device's IO cycle through the input unit and shortens it
+  // when it is long. Failure leaves the device as it was; capture still works, just in
+  // larger steps.
+  private func configureIOBuffer(on unit: AudioUnit, sampleRate: Double) {
+    var frames: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard
+      AudioUnitGetProperty(
+        unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &frames, &size)
+        == noErr
+    else { return }
+    var range: ClosedRange<Double>?
+    if let device = activeDevice(of: unit) {
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyBufferFrameSizeRange,
+        mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+      var value = AudioValueRange()
+      var valueSize = UInt32(MemoryLayout<AudioValueRange>.size)
+      if AudioObjectGetPropertyData(device, &address, 0, nil, &valueSize, &value) == noErr,
+        value.mMinimum <= value.mMaximum
+      {
+        range = value.mMinimum...value.mMaximum
+      }
+    }
+    guard
+      var target = Self.ioBufferFrames(current: frames, sampleRate: sampleRate, range: range)
+    else { return }
+    let status = AudioUnitSetProperty(
+      unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &target,
+      UInt32(MemoryLayout<UInt32>.size))
+    if status == noErr {
+      Log.debug("MIC", "Hardware IO cycle shortened from \(frames) to \(target) frames.")
+    } else {
+      Log.debug("MIC", "Could not shorten the hardware IO cycle (OSStatus \(status)).")
+    }
+  }
+
+  // A configuration notification can arrive before the replacement format is usable.
+  // Recovery preserves run intent and retries the complete tap/converter setup.
+  private func handleConfigurationChange() {
+    lifecycle.configurationChanged()
+  }
+
+  // INPUT_DEVICE=auto. Inspect on the hardware queue; only change a different device.
+  // Defer until the turn ends while recording, since rebuilding would drop buffers.
+  func reselectForLidState() {
+    lifecycle.queue.async { [self] in reselectOnHardwareQueue() }
+  }
+
+  private func reselectOnHardwareQueue() {
+    guard autoInput else { return }
+    let devices = InputDeviceCatalog.inputDevices()
+    guard let target = targetInput(in: devices), let unit = audioEngine.inputNode.audioUnit,
+      activeDevice(of: unit) != target.id
+    else { return }
+
+    lock.lock()
+    let recording = isRecording
+    lock.unlock()
+    if recording {
+      pendingReselect = true
+      return
+    }
+    pendingReselect = false
+    lifecycle.configurationChanged()
+  }
+
+  // Main-thread-only, called after each turn settles.
+  func applyPendingReselect() {
+    lifecycle.queue.async { [self] in
+      if pendingReselect { reselectOnHardwareQueue() }
+    }
+  }
+
+  private func interruptCapture(_ reason: String) {
+    lock.lock()
+    let notify = isRecording && !interruptionNotified
+    if isRecording {
+      turnInterrupted = true
+      interruptionNotified = true
+    }
+    lock.unlock()
+    if notify { onCaptureInterrupted?(reason) }
+  }
+
+  private func stopHardware() {
+    audioEngine.stop()
+    if sinkConnected {
+      audioEngine.disconnectNodeInput(sinkNode)
+      sinkConnected = false
+    }
+    audioProcessingQueue.sync {
+      lock.lock()
+      bufferEpoch &+= 1
+      preRollRingBuffer.removeAll(keepingCapacity: true)
+      lock.unlock()
+      audioConverter = nil
+      ring.discardAll()
+      ringDroppedSeen = ring.dropped
+    }
+  }
+
+  /// Installs the converter for a new hardware generation and drops any ring records left
+  /// from the previous one. Called before the IO unit starts.
+  func prepareCapture(converter: AVAudioConverter, generation: UInt64) {
+    audioProcessingQueue.sync {
+      audioConverter = converter
+      ringGeneration = generation
+      ring.discardAll()
+      ringDroppedSeen = ring.dropped
+    }
+  }
+
+  private func rebuildHardware() -> Bool {
+    let inputNode = audioEngine.inputNode
+    applyInputDeviceSelection()
+    let inputFormat = inputNode.outputFormat(forBus: 0)
+    guard inputFormat.sampleRate.isFinite, inputFormat.sampleRate > 0,
+      inputFormat.channelCount > 0,
+      let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+    else {
+      Log.warn("MIC", "Microphone format unavailable; recovery will retry.")
+      return false
+    }
+    prepareCapture(converter: converter, generation: lifecycle.generation)
+    startWakerIfNeeded()
+    if sinkNode.engine == nil { audioEngine.attach(sinkNode) }
+    audioEngine.connect(inputNode, to: sinkNode, format: inputFormat)
+    sinkConnected = true
+    audioEngine.prepare()
+    if let unit = inputNode.audioUnit {
+      configureIOBuffer(on: unit, sampleRate: inputFormat.sampleRate)
+    }
+    do {
+      try audioEngine.start()
+      return true
+    } catch {
+      Log.warn("MIC", "Microphone start failed; recovery will retry.")
+      return false
+    }
+  }
+
+  private func targetInput(in devices: [InputDeviceCatalog.Device]) -> InputDeviceCatalog.Device? {
+    if autoInput {
+      return InputDeviceCatalog.autoSelection(
+        in: devices, lidClosed: InputDeviceCatalog.lidClosed() ?? false)
+    }
+    return InputDeviceCatalog.match(preferredInputDevice, in: devices)
+  }
+
+  var currentInputLabel: String {
+    guard let d = currentInput else { return "unknown input" }
+    return d.label + (d.isDefault ? " (system default)" : "")
+  }
+
+  // Pins the AUHAL behind inputNode to the configured device (the property must be set
+  // before the engine initializes the unit, which prepare()/start() does), then records
+  // whichever device the unit ended up on - pinned, or the default when nothing matched.
+  private func applyInputDeviceSelection() {
+    let devices = InputDeviceCatalog.inputDevices()
+    let unit = audioEngine.inputNode.audioUnit
+
+    if !preferredInputDevice.isEmpty {
+      if let match = targetInput(in: devices) {
+        // Skip the write when already on the device: on a configuration change the
+        // unit is initialized and the property write would fail, but the pin holds.
+        if let unit = unit, activeDevice(of: unit) != match.id {
+          var deviceID = match.id
+          let status = AudioUnitSetProperty(
+            unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+            &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size))
+          if status != noErr {
+            Log.warn(
+              "MIC",
+              "Could not pin input to \(match.label) (OSStatus \(status)) - using whatever the engine has."
+            )
+          }
+        }
+      } else if !autoInput {
+        let available = devices.map { $0.name }.joined(separator: ", ")
+        Log.warn(
+          "MIC",
+          "INPUT_DEVICE \"\(preferredInputDevice)\" matched no input device - using the system default. Available: \(available)"
+        )
+      }
+    }
+
+    let selectedInput: InputDeviceCatalog.Device?
+    if let unit = unit, let activeID = activeDevice(of: unit) {
+      selectedInput =
+        devices.first(where: { $0.id == activeID })
+        ?? InputDeviceCatalog.describe(
+          activeID, isDefault: activeID == InputDeviceCatalog.defaultInputDevice())
+    } else {
+      selectedInput = devices.first(where: { $0.isDefault })
+    }
+    lock.lock()
+    inputSnapshot = selectedInput
+    lock.unlock()
+  }
+
+  private func activeDevice(of unit: AudioUnit) -> AudioDeviceID? {
+    var activeID = AudioDeviceID(0)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioUnitGetProperty(
+      unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &activeID, &size)
+    guard status == noErr, activeID != 0 else { return nil }
+    return activeID
+  }
+
+  func suspendEngine(completion: @escaping () -> Void = {}) {
+    lock.lock()
+    let recording = isRecording
+    lock.unlock()
+    guard !recording else { return }
+    lifecycle.suspend(completion: completion)
+  }
+
+  func ensureReady(completion: @escaping (Bool) -> Void) {
+    lifecycle.ensureReady(completion)
+  }
+
+  func prepareInput(completion: @escaping (MicrophonePreparationMeasurement) -> Void) {
+    lifecycle.queue.async { [self] in
+      let start = ProcessInfo.processInfo.systemUptime
+      let node = audioEngine.inputNode
+      var running: UInt32 = 0
+      var size = UInt32(MemoryLayout<UInt32>.size)
+      let status =
+        node.audioUnit.map {
+          AudioUnitGetProperty(
+            $0, kAudioOutputUnitProperty_IsRunning, kAudioUnitScope_Global, 0, &running, &size)
+        } ?? kAudio_ParamError
+      let measurement = MicrophonePreparationMeasurement(
+        milliseconds: (ProcessInfo.processInfo.systemUptime - start) * 1000,
+        engineRunning: audioEngine.isRunning, audioUnitStatus: status, audioUnitRunning: running)
+      DispatchQueue.main.async { completion(measurement) }
+    }
+  }
+
+  func cancelPendingReadiness() { lifecycle.cancelPendingReadiness() }
+
+  private func processIncomingBufferOnQueue(
+    _ inputBuffer: AVAudioPCMBuffer, generation: UInt64, capturedAt: TimeInterval,
+    healthDelivery: QueueDelivery<(UInt64, TimeInterval)>
+  ) {
+    guard let converter = audioConverter, inputBuffer.format == converter.inputFormat,
+      inputBuffer.format.sampleRate.isFinite, inputBuffer.format.sampleRate > 0
+    else {
+      discardFailedBuffer()
+      return
+    }
+
+    let ratio = 16000.0 / inputBuffer.format.sampleRate
+    let outCapacity = AVAudioFrameCount(Double(inputBuffer.frameLength) * ratio + 64)
+    guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity)
+    else {
+      discardFailedBuffer()
+      return
+    }
+
+    var error: NSError?
+    var consumed = false
+
+    let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+      if !consumed {
+        consumed = true
+        outStatus.pointee = .haveData
+        return inputBuffer
+      } else {
+        outStatus.pointee = .noDataNow
+        return nil
+      }
+    }
+
+    guard status != .error, error == nil else {
+      discardFailedBuffer()
+      return
+    }
+    if outputBuffer.frameLength > 0, let int16Pointer = outputBuffer.int16ChannelData?[0] {
+      let byteCount = Int(outputBuffer.frameLength) * 2
+      let chunkData = Data(bytes: int16Pointer, count: byteCount)
+      healthDelivery.submit((generation, capturedAt))
+
+      lock.lock()
+      if turnInterrupted && isRecording {
+        lock.unlock()
+        return
+      }
+      let currentlyRecording = isRecording
+
+      if !currentlyRecording {
+        // Maintain 250ms pre-roll circular buffer while idle
+        preRollRingBuffer.append(chunkData)
+        if preRollRingBuffer.count > maxPreRollBytes {
+          preRollRingBuffer.removeFirst(preRollRingBuffer.count - maxPreRollBytes)
+        }
+        lock.unlock()
+        return
+      }
+
+      recordedPCMData.append(chunkData)
+      pendingChunkBuffer.append(chunkData)
+      chunkCount += 1
+      accumulateStats(samples: int16Pointer, count: Int(outputBuffer.frameLength))
+
+      // 10Hz meter throttle decision must happen under the lock since it mutates
+      // lastMeterUpdateTime; only snapshot the meter's inputs when actually needed.
+      let now = ProcessInfo.processInfo.systemUptime
+      var shouldUpdateMeter = false
+      var elapsed: Double = 0
+      var kbStreamed: Double = 0
+      var chunkCountSnapshot = 0
+      if (now - lastMeterUpdateTime) > 0.10 {
+        lastMeterUpdateTime = now
+        shouldUpdateMeter = true
+        elapsed = now - recordingStartTime
+        kbStreamed = Double(recordedPCMData.count) / 1024.0
+        chunkCountSnapshot = chunkCount
+      }
+
+      // Coalesce audio into CHUNK_MS frames (default 100 ms) before dispatching to WebSocket.
+      // Hardware cycles (512 frames at 48 kHz is 10.67 ms) do not divide CHUNK_MS, so cut
+      // exactly at the target and carry the remainder: each frame stays CHUNK_MS long, as
+      // it was when the old tap delivered 100 ms buffers. A cycle longer than CHUNK_MS
+      // completes more than one frame, so emit every complete frame in order and keep only
+      // a remainder shorter than the target; otherwise the backlog grows for the whole turn.
+      var toStream: [Data] = []
+      var offset = pendingChunkBuffer.startIndex
+      while pendingChunkBuffer.endIndex - offset >= streamingChunkTargetBytes {
+        let cut = offset + streamingChunkTargetBytes
+        toStream.append(pendingChunkBuffer.subdata(in: offset..<cut))
+        offset = cut
+      }
+      if offset != pendingChunkBuffer.startIndex {
+        pendingChunkBuffer.removeSubrange(pendingChunkBuffer.startIndex..<offset)
+      }
+      lock.unlock()
+
+      // Audio delivery leads everything else on this queue: stdout is unbuffered and the
+      // meter write below is a synchronous flush, so a slow or blocked terminal must
+      // never sit between a finished chunk and its trip to the WebSocket.
+      for chunk in toStream {
+        onAudioChunk?(chunk)
+      }
+
+      // RMS math runs for every buffer while recording (not just the meter's 10Hz
+      // throttle) so stopRecording's adaptive trailing-capture poll always sees a fresh
+      // level. int16Pointer is still valid here - it points into outputBuffer, a local
+      // var alive for this call. Meter rendering and the onAudioLevel callback stay
+      // gated by shouldUpdateMeter as before.
+      var sumSquare: Double = 0.0
+      let sampleCount = Int(outputBuffer.frameLength)
+      for i in 0..<sampleCount {
+        let sample = Double(int16Pointer[i])
+        sumSquare += sample * sample
+      }
+      let rms = sqrt(sumSquare / Double(max(sampleCount, 1)))
+      let db = 20.0 * log10(max(rms, 1.0) / 32768.0)
+
+      lock.lock()
+      lastLevelDb = db
+      lastLevelTime = ProcessInfo.processInfo.systemUptime
+      lock.unlock()
+
+      // HUD level first, terminal meter last - the print is the only call here that can
+      // block on an external consumer.
+      if shouldUpdateMeter {
+        onAudioLevel?(db)
+        let meterBars = renderVolumeMeter(db: db)
+        Log.meter(
+          "🎙️  RECORDING [\(meterBars)] \(String(format: "%5.1f", db)) dB | \(String(format: "%.2fs", elapsed)) | \(String(format: "%.1f", kbStreamed)) KB streamed (#\(chunkCountSnapshot))"
+        )
+      }
+    }
+  }
+
+  // A single conversion failure loses speech even when the following buffer is healthy.
+  func discardFailedBuffer() {
+    lock.lock()
+    if isRecording { turnInterrupted = true }
+    let epoch = bufferEpoch
+    lock.unlock()
+    overloadDelivery.submit(epoch)
+  }
+
+  private func renderVolumeMeter(db: Double) -> String {
+    let normalized = max(0.0, min(1.0, (db + 50.0) / 50.0))
+    let totalBlocks = 12
+    let filledBlocks = Int(round(normalized * Double(totalBlocks)))
+    let emptyBlocks = totalBlocks - filledBlocks
+
+    let filledStr = String(repeating: "█", count: filledBlocks)
+    let emptyStr = String(repeating: "░", count: emptyBlocks)
+    return "\(filledStr)\(emptyStr)"
+  }
+
+  // Assumes `lock` is held. Streams samples into the peak + 20ms-frame RMS accumulators.
+  // Pure math - no I/O or callbacks under the lock.
+  private func accumulateStats(samples: UnsafePointer<Int16>, count: Int) {
+    for i in 0..<count {
+      let s = Int32(samples[i])
+      let a = abs(s)
+      if a > turnMaxAbsSample { turnMaxAbsSample = a }
+      let norm = Double(s) / 32768.0
+      frameSumSquares += norm * norm
+      frameSampleCount += 1
+      if frameSampleCount == Self.speechFrameSamples {
+        let rms = (frameSumSquares / Double(Self.speechFrameSamples)).squareRoot()
+        frameDbValues.append(20 * log10(max(rms, 1e-9)))
+        frameSumSquares = 0
+        frameSampleCount = 0
+      }
+    }
+    statSampleCount += count
+  }
+
+  // Assumes `lock` is held. Byte-pair assembly because Data's storage isn't guaranteed
+  // 2-byte aligned; only used for the pre-roll (≤400ms), live audio feeds the pointer
+  // variant directly.
+  private func accumulateStats(data: Data) {
+    let sampleCount = data.count / 2
+    guard sampleCount > 0 else { return }
+    var samples = [Int16](repeating: 0, count: sampleCount)
+    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+      for i in 0..<sampleCount {
+        samples[i] = Int16(bitPattern: UInt16(raw[2 * i]) | (UInt16(raw[2 * i + 1]) << 8))
+      }
+    }
+    samples.withUnsafeBufferPointer { buf in
+      accumulateStats(samples: buf.baseAddress!, count: buf.count)
+    }
+  }
+
+  @discardableResult func startRecording() -> Bool {
+    guard isEngineRunning else { return false }
+    audioProcessingQueue.sync { startRecordingOnQueue() }
+    return true
+  }
+
+  func startRecordingOnQueue() {
+    // Audio the hardware delivered before key-down belongs to the pre-roll, not the turn.
+    drainRingOnQueue()
+    lock.lock()
+    turnInterrupted = false
+    interruptionNotified = false
+    recordedPCMData.removeAll(keepingCapacity: true)
+    pendingChunkBuffer.removeAll(keepingCapacity: true)
+    turnMaxAbsSample = 0
+    frameSumSquares = 0
+    frameSampleCount = 0
+    frameDbValues.removeAll(keepingCapacity: true)
+    statSampleCount = 0
+
+    // Prepend rolling pre-roll buffer to prevent clipped first syllable
+    preRollBytesInTurn = 0
+    preRollFrameCountInTurn = 0
+    var immediatePreRollChunk: Data? = nil
+    if !preRollRingBuffer.isEmpty {
+      preRollBytesInTurn = preRollRingBuffer.count
+      recordedPCMData.append(preRollRingBuffer)
+      immediatePreRollChunk = preRollRingBuffer
+      // Pre-roll bytes bypass the live accumulation below (they were captured while
+      // idle), so their stats are folded in once here - a ≤400ms scan, off the key-up
+      // path entirely.
+      accumulateStats(data: preRollRingBuffer)
+      // Frames the pre-roll completed; onset_db starts reading after this many.
+      preRollFrameCountInTurn = frameDbValues.count
+      preRollRingBuffer.removeAll(keepingCapacity: true)
+    }
+
+    chunkCount = 0
+    recordingStartTime = ProcessInfo.processInfo.systemUptime
+    lastMeterUpdateTime = 0
+    isRecording = true
+    lock.unlock()
+
+    // Immediately dispatch pre-roll audio to WebSocket so speech model receives head-start
+    // audio - split into streaming-target-sized frames rather than one oversized payload
+    // (the whole pre-roll still goes out right now; only the framing changes).
+    if let chunk = immediatePreRollChunk {
+      var offset = chunk.startIndex
+      while offset < chunk.endIndex {
+        let end =
+          chunk.index(offset, offsetBy: streamingChunkTargetBytes, limitedBy: chunk.endIndex)
+          ?? chunk.endIndex
+        onAudioChunk?(chunk.subdata(in: offset..<end))
+        offset = end
+      }
+    }
+  }
+
+  /// How long the post-roll wait should sleep before it looks at the microphone again.
+  /// Zero means every condition is already met and the wait may end now.
+  ///
+  /// The grace window can still be pushed out by new speech, so while it is open the wait
+  /// polls. The minTrailSec floor cannot move, so once grace is satisfied the wait sleeps
+  /// straight to the floor instead of stepping toward it in poll-sized hops. That is what
+  /// removes the quantization: a turn that banked its quiet before key-up used to leave at
+  /// three 25ms polls (about 75ms) against a 60ms floor, and now leaves at the floor.
+  /// The semantics of graceSec, minTrailSec and maxTrailSec are unchanged; only the instant
+  /// the loop notices they are met moves. minTrailSec still exists so that even a fully
+  /// banked window keeps a sliver of post-release capture: a soft final fricative can sit
+  /// under the threshold and a hardware buffer's worth of it may still be in flight at
+  /// key-up.
+  static func postRollWakeDelay(
+    now: TimeInterval, entryTime: TimeInterval, quietStart: TimeInterval?, graceSec: Double,
+    minTrailSec: Double, maxTrailSec: Double, pollSec: Double = AudioCaptureEngine.postRollPollSec
+  ) -> TimeInterval {
+    let capRemaining = entryTime + maxTrailSec - now
+    if capRemaining <= 0 { return 0 }
+    // Speaking: only the hard cap can end the wait, so poll for the next quiet frame.
+    guard let quietStart = quietStart else { return min(pollSec, capRemaining) }
+    if quietStart + graceSec - now > 0 { return min(pollSec, capRemaining) }
+    let floorRemaining = entryTime + minTrailSec - now
+    if floorRemaining <= 0 { return 0 }
+    return min(floorRemaining, capRemaining)
+  }
+
+  /// Whether a post-release level reading is speech. A stale reading is quiet. While the
+  /// quiet window banked before release is unbroken, the configured line decides: that bank
+  /// was judged on it, and a soft final word under the raised adaptive line must reset it
+  /// rather than end capture at the floor. After the first reset, the adaptive line applies
+  /// to the fresh post-release window.
+  static func isTrailSpeaking(
+    levelDb: Double, stale: Bool, bankedWindow: Bool, configuredDb: Double, adaptiveDb: Double
+  ) -> Bool {
+    guard !stale else { return false }
+    return levelDb >= (bankedWindow ? configuredDb : adaptiveDb)
+  }
+
+  func stopRecording(
+    gracePeriodMs: Int, minTrailMs: Int, maxTrailMs: Int, silenceThresholdDb: Double,
+    quietMarginDb: Double = 0
+  ) -> (
+    pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?,
+    speechFrames: Int, interrupted: Bool, finalize: CaptureFinalizeStats
+  ) {
+    // True hold duration is measured at entry, BEFORE the post-roll wait - otherwise the
+    // grace period pads every tap past the caller's micro-click duration threshold.
+    let stopRequestTime = ProcessInfo.processInfo.systemUptime
+
+    // Capture finalization diagnostics for whichever branch below runs. All default
+    // to the "no wait happened" values; the adaptive branch is the only one that overwrites
+    // drainMs/bankedQuietMs/quietResets/trailPeakDb, matching CaptureFinalizeStats' own
+    // "0/nil when that branch never ran" contract.
+    var finalizeExit = "none"
+    var finalizeDrainMs = 0.0
+    var bankedQuietMs = 0.0
+    var quietResets = 0
+    var trailPeakDb: Double? = nil
+    var quietThresholdDb: Double? = nil
+
+    // 1. Trailing capture: keep streaming while speech energy persists. gracePeriodMs is the
+    // required continuous-quiet window; maxTrailMs the hard cap. maxTrailMs <= gracePeriodMs
+    // degenerates to the old fixed post-roll. A stale level reading (engine stall) counts as
+    // quiet so a wedged tap can never hold the turn to the cap.
+    if gracePeriodMs <= 0 {
+      // Adaptation and fixed post-roll both disabled - no wait.
+      finalizeExit = "none"
+    } else if maxTrailMs <= gracePeriodMs {
+      usleep(useconds_t(gracePeriodMs * 1000))
+      finalizeExit = "fixed"
+    } else {
+      let graceSec = Double(gracePeriodMs) / 1000.0
+      let maxTrailSec = Double(maxTrailMs) / 1000.0
+      let minTrailSec = Double(minTrailMs) / 1000.0
+      // Quiet banked BEFORE the release counts toward the window: most releases come
+      // after the speaker has already finished, and the old floor of a full window
+      // after key-up was ~250ms of pure wait on those turns (history p50 capture
+      // finalize 290ms, min 283ms). The trailing sub-threshold 20ms frames give the
+      // banked quiet without timestamps, PROVIDED the stats are current: drain the
+      // processing queue first, or a backlog (blocked meter write) would leave loud
+      // buffers unaccounted for while their frames get credited as quiet. After the
+      // drain the only lag is the in-flight hardware buffer, which under-credits.
+      let drainStart = ProcessInfo.processInfo.systemUptime
+      audioProcessingQueue.sync { drainRingOnQueue() }
+      finalizeDrainMs = (ProcessInfo.processInfo.systemUptime - drainStart) * 1000.0
+      // Copy under the lock, sort after it (see finishRecording's noise floor).
+      lock.lock()
+      let turnFrames = frameDbValues
+      lock.unlock()
+      let quietDb = Self.quietThresholdDb(
+        frames: turnFrames, configuredDb: silenceThresholdDb, marginDb: quietMarginDb)
+      quietThresholdDb = quietDb
+      // Quiet banked before release is judged against the configured threshold, not the
+      // adaptive line: a soft final syllable under the raised line must not count as banked
+      // quiet, or a release during it could end capture at the floor. A noisy room then
+      // banks little and waits out the full quiet window after release, under the adaptive
+      // line, which still ends it well before the cap.
+      var quietFrames = 0
+      for db in turnFrames.reversed() {
+        if db > silenceThresholdDb { break }
+        quietFrames += 1
+      }
+      bankedQuietMs = Double(quietFrames) * 20.0
+      var quietStart: CFAbsoluteTime? =
+        quietFrames > 0 ? stopRequestTime - Double(quietFrames) * 0.02 : nil
+      // True until the first post-release speaking reading. While it holds, the quiet window
+      // started before release and fresh audio is judged on the same configured line.
+      var bankedWindow = quietFrames > 0
+      // Whether the iteration that will end up satisfying "quiet" was a stale level
+      // reading, tracked as the loop runs so the classification below needs no re-derivation.
+      var lastIterationStale = false
+      while true {
+        let now = ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        let levelDb = lastLevelDb
+        let levelTime = lastLevelTime
+        lock.unlock()
+
+        trailPeakDb = trailPeakDb.map { max($0, levelDb) } ?? levelDb
+        let stale = (now - levelTime) > 0.30
+        lastIterationStale = stale
+        let speaking = Self.isTrailSpeaking(
+          levelDb: levelDb, stale: stale, bankedWindow: bankedWindow,
+          configuredDb: silenceThresholdDb, adaptiveDb: quietDb)
+        if speaking {
+          if quietStart != nil { quietResets += 1 }
+          quietStart = nil
+          bankedWindow = false
+        } else if quietStart == nil {
+          quietStart = now
+        }
+
+        let delay = Self.postRollWakeDelay(
+          now: now, entryTime: stopRequestTime, quietStart: quietStart, graceSec: graceSec,
+          minTrailSec: minTrailSec, maxTrailSec: maxTrailSec)
+        if delay <= 0 {
+          finalizeExit = Self.trailExitReason(
+            now: now, entryTime: stopRequestTime, quietStart: quietStart, graceSec: graceSec,
+            minTrailSec: minTrailSec, maxTrailSec: maxTrailSec,
+            quietIsStale: lastIterationStale)
+          break
+        }
+        // Round up so a sub-microsecond remainder cannot spin the loop.
+        usleep(useconds_t(max(1.0, (delay * 1_000_000).rounded(.up))))
+      }
+
+      let totalWaitMs = (ProcessInfo.processInfo.systemUptime - stopRequestTime) * 1000.0
+      if totalWaitMs > Double(gracePeriodMs) + 1.0 {
+        Log.debug(
+          "AUDIO",
+          "Trailing speech captured: +\(Int(totalWaitMs - Double(gracePeriodMs)))ms past post-roll")
+      } else if totalWaitMs < Double(gracePeriodMs) - 1.0 {
+        Log.debug(
+          "AUDIO",
+          "Post-roll shortened to \(Int(totalWaitMs))ms (\(quietFrames * 20)ms quiet banked before release)"
+        )
+      }
+    }
+
+    let trailWaitMs = (ProcessInfo.processInfo.systemUptime - stopRequestTime) * 1000.0
+
+    return audioProcessingQueue.sync {
+      // Everything the hardware delivered up to now is part of the turn.
+      drainRingOnQueue()
+      return finishRecording(
+        stopRequestTime: stopRequestTime, silenceThresholdDb: silenceThresholdDb,
+        finalizeExit: finalizeExit, finalizeDrainMs: finalizeDrainMs, trailWaitMs: trailWaitMs,
+        bankedQuietMs: bankedQuietMs, quietResets: quietResets, trailPeakDb: trailPeakDb,
+        quietThresholdDb: quietThresholdDb)
+    }
+  }
+
+  private func finishRecording(
+    stopRequestTime: CFAbsoluteTime, silenceThresholdDb: Double, finalizeExit: String,
+    finalizeDrainMs: Double, trailWaitMs: Double, bankedQuietMs: Double, quietResets: Int,
+    trailPeakDb: Double?, quietThresholdDb: Double?
+  ) -> (
+    pcmData: Data, duration: Double, chunkCount: Int, capturedBytes: Int, peakDb: Double?,
+    speechFrames: Int, interrupted: Bool, finalize: CaptureFinalizeStats
+  ) {
+    // The gate and final chunk delivery share the capture queue. A new hardware buffer
+    // cannot send later audio ahead of the pre-roll or after the end-of-turn signal.
+    lock.lock()
+    isRecording = false
+
+    // 3. Real captured byte count: taken before the silence flush below is appended, and
+    // excluding the prepended pre-roll, so callers see genuine key-held speech audio only.
+    let interrupted = turnInterrupted
+    let capturedBytes = max(0, recordedPCMData.count - preRollBytesInTurn)
+
+    // 4. Collect any trailing pending chunk; fired via onAudioChunk after the lock is released
+    var trailingChunk: Data? = nil
+    if !pendingChunkBuffer.isEmpty {
+      trailingChunk = pendingChunkBuffer
+      pendingChunkBuffer.removeAll(keepingCapacity: true)
+    }
+
+    // 5. Append the acoustic lookahead silence flush (SILENCE_FLUSH_MS; default 200ms =
+    // 6,400 bytes @ 16kHz 16-bit mono). This satisfies the lookahead window speech
+    // encoders need to finalize trailing words; appended AFTER stat accumulation stopped,
+    // so the silence gate never sees it regardless of duration.
+    let silenceData = Data(count: silenceFlushBytes)
+    if !silenceData.isEmpty {
+      recordedPCMData.append(silenceData)
+    }
+
+    let data = recordedPCMData
+    let duration = stopRequestTime - recordingStartTime
+    let chunks = chunkCount
+
+    // 6. Silence-gate stats from the running accumulators - no rescan of the clip. The
+    // silence flush above was appended AFTER accumulation stopped, so it can never mask
+    // genuine silence; nil peak means zero real (pre-roll + key-held) samples, which
+    // callers treat as "not silent", matching the old too-short-clip behavior.
+    let peakDb: Double? =
+      statSampleCount > 0 ? 20 * log10(max(Double(turnMaxAbsSample), 1.0) / 32768.0) : nil
+    var speechFrames = 0
+    for db in frameDbValues where db > silenceThresholdDb { speechFrames += 1 }
+    // Whole-clip noise floor, from the same frameDbValues population speechFrames just
+    // counted from. Copy the array under lock (cheap: value-type retain, no element copy
+    // until something mutates it) and sort it after unlock - a long clip can carry
+    // thousands of frames, and sorting them is not the kind of pure O(n) pass the rest of
+    // this lock scope does, so it should not add latency to the audio tap's next write.
+    let noiseFloorFrames = frameDbValues
+    lock.unlock()
+    let noiseFloorDb = Self.noiseFloorDb(frames: noiseFloorFrames)
+
+    let finalize = CaptureFinalizeStats(
+      exit: finalizeExit, drainMs: finalizeDrainMs, trailWaitMs: trailWaitMs,
+      bankedQuietMs: bankedQuietMs, quietResets: quietResets, trailPeakDb: trailPeakDb,
+      noiseFloorDb: noiseFloorDb, quietThresholdDb: quietThresholdDb)
+
+    // 7. Fire chunk callbacks outside the lock. Ordering preserved: trailing real audio first, then silence.
+
+    if !interrupted, let trailing = trailingChunk {
+      onAudioChunk?(trailing)
+    }
+    if !interrupted, !silenceData.isEmpty {
+      onAudioChunk?(silenceData)
+    }
+
+    Log.endMeter()
+    return (data, duration, chunks, capturedBytes, peakDb, speechFrames, interrupted, finalize)
+  }
+
+  func stopEngine() {
+    // Keep the AVAudioEngine owner alive until queued hardware shutdown completes.
+    lifecycle.suspend { [self] in withExtendedLifetime(self) {} }
+  }
+}

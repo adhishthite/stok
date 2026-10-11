@@ -1,0 +1,262 @@
+# Validation
+
+Earlier measurements below predate the move to Sarvam AI. Backend-dependent
+results from the previous backend were removed or replaced with a statement of
+what must be re-run. Signing, notarization, Sparkle, microphone, and test-count
+records are unchanged.
+
+## Sarvam port, 2026-10-07
+
+`make check` for the port: 181 XCTests executed, 6 gated live tests skipped,
+0 failures. 62 Python tests passed.
+
+`make test-live` passed 5 tests against Sarvam:
+
+- Three live turns settled by `server_final`. Audio-end-to-settle times, from
+  `build/live-api-results.json`, were 155, 216, and 173 ms.
+- A REST short clip passed.
+- A REST 40 s clip, split into pieces, passed in 1.1 s.
+- The service probe accepted a good key and named a bad one.
+- A rejected key stopped the live client after 3 attempts, in 7.2 s.
+
+`make test-cleanup-live` completed 5 cases in 127 to 241 ms with
+`sarvam-105b-conversations`. The record is `build/post-processing-live-check.json`.
+
+These are small sequential samples. They exclude microphone finalization and paste
+delivery. They do not establish accuracy, a sub-500 ms key-up-to-paste result, or a
+latency distribution. Real-speech accuracy, per-language slices, and key-up-to-paste
+latency on Sarvam are not yet measured. See [ACCEPTANCE_SESSION.md](ACCEPTANCE_SESSION.md).
+
+## Current result
+
+The signed distribution at source `061f46c1b42a` has now passed Apple
+notarization, app and DMG stapling, and local Gatekeeper assessment. The apps
+inside both final containers passed independent ticket, signature, and Gatekeeper
+checks. Real Sparkle tools also verified signed feed/archive output and rejected
+modified copies. [DISTRIBUTION.md](DISTRIBUTION.md) records submission IDs,
+commands, hashes, and the remaining fresh-Mac and installed-update gates. The
+older rejection results below are historical.
+
+Build 4 adds optional cleanup and application-context formatting, both off by
+default, with separate latency, token, cost, and failure metrics. `make check`
+passed 66 XCTest cases, skipped three explicit live cases, and passed seven
+script tests; the settings reference matched all 53 entries. The log is
+`/tmp/stok-cleanup-release-check.log`. Nine focused cleanup tests passed with
+Thread Sanitizer and no reported race (`/tmp/stok-cleanup-tsan.log`).
+
+`make test-cleanup-live` passed five synthetic text-only cases, including the
+three-line list check. Cleanup timing from that run was on the previous backend and
+is removed. This did not verify real-speech accuracy or end-to-end latency with
+cleanup enabled. [POSTPROCESSING.md](POSTPROCESSING.md)
+records behavior, limits, data handling, and metric semantics.
+
+The current feedback batch adds a compact Settings toolbar, removes the sidebar
+toggle, provides explicit connection-test badges with cancellation/invalidation,
+and reveals the running app for permission setup. Build 3 adds the app icon and
+colored navigation symbols to the menu, labels vocabulary analysis as “Analyze
+history…”, and removes the legacy configuration-import actions from both setup
+and Settings. The unused configuration file chooser was deleted. Development
+`.env` seeding remains separate from the product UI.
+
+`make check` for this batch completed with `TEST SUCCEEDED`: 54 XCTest cases
+passed, two explicit live cases skipped, seven Python tests passed, and the
+47-setting README check passed. Formatting and shell syntax passed. The log is
+`/tmp/stok-menu-feedback-check.log`. Both archive and export passed, as did Apple
+notarization, stapling, and container checks recorded in DISTRIBUTION.md.
+Updated visual alignment, badge colors, and menu appearance await the owner's
+running-app review; a passing build does not establish those visual results.
+
+## Previous UI checkpoints
+
+On 2026-09-06, the History table gained native Copy and Delete command handlers.
+Copy uses the same full text and display order as context-menu Copy. Delete opens
+the existing confirmation and does nothing when no rows are selected. These
+handlers are scoped to the table so text editing elsewhere retains its commands.
+
+`make check` exited 0: 54 XCTest cases passed, two explicit live cases skipped,
+seven Python script tests passed, and the compiled 47-setting reference matched
+README. Strict Swift formatting, shell syntax, and `git diff --check` passed.
+The log is `/tmp/stok-history-keyboard-check.log`. The script-test notarization
+messages are mocked responses, not submissions or acceptance by Apple.
+
+Setup inspection remained inconclusive. The exact-app UI call timed out at five
+seconds. A separate bounded AX query had accessibility permission but returned an
+application element in the window list. Core Graphics confirmed the setup-sized
+window was on screen, while a window-only screenshot failed. No VoiceOver,
+interactive keyboard, visual layout, or window latency pass is claimed. These
+observations do not establish the cause of the inspection failure.
+
+The full acceptance procedure is in [ACCEPTANCE.md](ACCEPTANCE.md). The app goal
+remains incomplete. The following checkpoints retain their original scope.
+
+## Previous checkpoints
+
+Microphone lifecycle operations now run on a serial hardware queue. The measured
+main-thread setup interval fell from 306/86/78 ms to 0.132/0.065/0.057 ms in the
+three-attempt Instruments probe. Total hardware readiness remains roughly
+462/191/194 ms; this is not evidence of faster transcription or first-word
+capture. [PERFORMANCE.md](PERFORMANCE.md) records the traces and scope.
+
+After this change, `make check` passed 30 XCTest cases, skipped two explicit
+live-API cases, and passed all four script tests. A targeted Thread Sanitizer
+run passed five lifecycle/recovery tests with no race reports.
+
+Latest distribution checkpoint: `make distribute` completed with
+`ARCHIVE SUCCEEDED` and `EXPORT SUCCEEDED`. The universal Developer ID app,
+signed DMG, and ZIP passed signature, architecture, entitlement, and archive
+content checks. `spctl --assess --type execute --verbose` returned `rejected`,
+`source=Unnotarized Developer ID`. No notarization or update delivery is claimed.
+
+At the distribution checkpoint, `make check` completed with `TEST SUCCEEDED`: 25 XCTest cases passed,
+two explicit live API cases skipped, and zero failures. Four additional Python
+tests passed for notarization resume, interrupted upload recovery, changed
+archive identity, and rejected-submission handling. These tests mock Apple
+responses; they are not evidence of successful notarization. Strict Swift
+format lint, script syntax, `git diff --check`, and Ruff on the new Python files
+passed. Distribution workflow details are in [DISTRIBUTION.md](DISTRIBUTION.md).
+
+The following initial checkpoint is retained as historical evidence. Its
+permission status predates the owner's permission grants.
+
+The compiled app launches with a development signature and hardened runtime.
+The engine is connected to the observable store, menu-bar state, setup checklist,
+Keychain configuration, and Diagnostics window. Real microphone dictation is
+awaiting the owner's macOS permission grants. It is not yet proven end to end.
+
+The app's credential-free development report confirmed:
+
+```json
+{"hasAPIKey":true,"microphone":false,"accessibility":false,"inputMonitoring":false,"status":"Setup required","latency":"No dictations measured yet."}
+```
+
+## Checks actually run
+
+- `make install`: `swift format` 6.3.0; XcodeGen generated Stok.xcodeproj.
+- `make format`: exited 0.
+- `make check`: strict Swift format lint, XCTest, `git diff --check`, and
+  `bash -n` for the build scripts passed. XCTest output:
+
+```text
+Executed 4 tests, with 0 failures (0 unexpected)
+Executed 14 tests, with 2 tests skipped and 0 failures (0 unexpected)
+** TEST SUCCEEDED **
+```
+
+The two skipped tests require the explicit Live scheme. The offline tests include
+the five reference suites, 300 differential correction cases, 10,000 independent
+window-search cases, deadline bounds, WAV bytes, native store events,
+configuration parsing, and cancellation of queued settlement after engine stop.
+
+- `make run`: `BUILD SUCCEEDED`, then `Stok is running.`
+- `codesign -dv --verbose=4`: `Identifier=com.adhishthite.stok` and
+  `flags=0x10000(runtime)` on the development-signed app.
+- `codesign --verify --strict --verbose=2`: `valid on disk` and
+  `satisfies its Designated Requirement` with host Keychain access.
+- `plutil -lint Config/Info.plist Config/Stok.entitlements`: both `OK`.
+- `make package`: `BUILD SUCCEEDED`; created `build/package/Stok.zip`.
+- `lipo -archs` on the Release executable: `x86_64 arm64`.
+- `git check-ignore .env`: `.env`.
+
+The initial sandboxed XCTest run failed because it could not access testmanagerd.
+Host-access runs passed. The initial ad-hoc launch exposed a debug-dylib signing
+mismatch. Development identity selection and a direct debug executable corrected
+that launch failure. The UI inspection service timed out, so no visual inspection
+or VoiceOver validation is claimed.
+
+## Real API checks
+
+Generated one 16 kHz mono synthetic sentence using macOS speech synthesis:
+"Please send the revised architecture report by Friday."
+
+Ran:
+
+```sh
+./Scripts/xcodebuild.sh -project Stok.xcodeproj -scheme StokLiveChecks \
+  -configuration Debug -derivedDataPath build/DerivedData \
+  -destination 'platform=macOS' \
+  -only-testing:StokEngineTests/LiveIntegrationTests test
+```
+
+```text
+testRESTFallbackTranscribesSpeech passed
+testThreeLiveTurns passed
+Executed 2 tests, with 0 failures
+** TEST SUCCEEDED **
+```
+
+That run, on the previous backend, passed both tests. Its per-turn settle times
+and sentence match are removed. They are not Sarvam results. The first Sarvam live
+results are in the 2026-10-07 section above. These small, sequential samples did
+not establish a sub-500 ms result. They exclude microphone finalization and paste
+delivery.
+
+## Owner test at the working-dictation gate
+
+1. In Stok, open Set up Stok and enable all three permissions. Expected: each row
+   changes to Allowed, and the menu-bar status becomes Ready. Failure: a row
+   remains ungranted or configuration reports an error.
+2. Open an empty TextEdit document. Hold the configured hotkey, speak a short
+   sentence, and release. Expected: one transcript appears once. Failure: no text,
+   duplicate text, clipped words, or a delivery error.
+3. Repeat in English, Marathi, and mixed speech. Include a mid-sentence pause,
+   quick re-press while processing, and hold-to-lock.
+4. Open Stok Diagnostics after each turn. Expected: a LATENCY line with route,
+   capture, API, injection, total, and delivery outcome. Paste dispatch alone
+   does not prove TextEdit received the text; inspect the document too.
+
+The real-dictation median, accuracy comparison, native UI responsiveness,
+notarization, Gatekeeper, and fresh-account onboarding remain unverified.
+The overall application goal remains active.
+
+## Bounded execution and microphone readiness
+
+The in-app microphone probe completed three startup attempts with zero pre-roll:
+382.6 ms, 180.9 ms, and 163.7 ms. It did not start a recording or send audio to
+transcription. These are hardware-readiness delays, not key-up-to-paste latency.
+The first-start delay warrants further profiling and first-word capture tests.
+
+Builds and tests now run through `Scripts/bounded_run.py`, with a 120-second
+initial deadline. The runner prints its live process ID and control-file path.
+After checking actual progress, extend that live deadline by up to 60 seconds:
+
+```sh
+python3 Scripts/bounded_run.py --extend CONTROL_FILE --seconds 60
+```
+
+The deadline helper passed normal completion, expiry (exit 124), live extension,
+rejection of extension after completion, and child cleanup after malformed control
+data. Ruff passed. The full XCTest run passed with 20 tests passed and two explicit
+live-API tests skipped. Deadline supervision bounds external commands; it cannot
+preempt a model or client stall before the next tool call.
+
+## Release automation and History loading, 2026-09-06
+
+Three independent subagent tasks used five-minute work limits. The release
+review found and fixed descendant cleanup after command timeout, mismatched
+existing tags, and notarization polls exceeding the remaining polling budget.
+The History review removed the initial search debounce and sets loading before
+starting a query, preventing a false empty state.
+
+- `make check`, supervised with a 120-second limit, passed before these fixes.
+- After the History fix, the same command reported `TEST SUCCEEDED`: 68 XCTest
+  passes, three explicit live-test skips, and zero XCTest failures. The settings
+  reference reported `PASS: README matches all 53 catalog settings.`
+- That run's script phase failed in the concurrently added deadline fixtures
+  because the sandbox denied process-group signals. This is not a full-suite pass.
+- The focused release suite passed nine tests in 6.525 seconds.
+- `make check-ci ACTIONLINT=build/tools/actionlint`, supervised with a 60-second
+  limit, passed after the release fixes. The native Keychain helper retains its
+  documented SDK deprecation warning.
+- After the owner removed sandbox restrictions, final `make check` passed with
+  exit 0: 68 XCTest passes, three live-test skips, all 53 settings matched, and
+  18 script tests passed in 18.193 seconds with no script skips. This includes
+  the timeout and interrupt descendant-cleanup regressions. Final `make check-ci`
+  also passed. Logs: `/tmp/stok-final-check.log` and `/tmp/stok-final-ci-check.log`.
+- Ruff lint for the deadline runner and its fixtures passed after two style
+  corrections. Synthetic processes have their own finite lifetimes, and tests
+  explicitly skip before spawning descendants when group signals are prohibited.
+
+The workflow files have not run on GitHub. No signing credentials were exported,
+no remote was configured, and nothing was pushed or published. Interactive
+acceptance gates remain listed in [ACCEPTANCE.md](ACCEPTANCE.md). The History
+change is a source change, not an update to the installed build 4.

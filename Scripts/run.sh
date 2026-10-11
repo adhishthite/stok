@@ -1,0 +1,48 @@
+#!/bin/bash
+# Copyright 2026 Adhish Thite
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+app="${1:?Pass the built Stok.app path}"
+if pgrep -x Stok >/dev/null; then
+    python3 "$(dirname "$0")/bounded_run.py" --seconds 10 --label quit -- osascript -e 'tell application id "com.adhishthite.stok" to quit'
+    for ((attempt=0; attempt<50; attempt++)); do
+        pgrep -x Stok >/dev/null || break
+        sleep 0.1
+    done
+    if pgrep -x Stok >/dev/null; then
+        echo 'Stok has not quit. Close Stok before running again.' >&2
+        exit 1
+    fi
+fi
+root="$(cd "$(dirname "$0")/.." && pwd)"
+args=()
+if [[ -f "$root/.env" ]]; then
+    args+=(--config-file "$root/.env" --status-file "$root/build/runtime-status.json")
+fi
+if [[ "${STOK_SHOW_SETUP:-0}" == 1 ]]; then args+=(--show-setup); fi
+if [[ "${STOK_PROBE_MIC:-0}" == 1 ]]; then args+=(--probe-microphone); fi
+if [[ "${STOK_PREPARE_MIC:-0}" == 1 ]]; then args+=(--prepare-microphone); fi
+if [[ "${STOK_PROFILE_MIC:-0}" == 1 ]]; then
+    trace="$root/build/microphone-startup-$(date +%Y%m%d-%H%M%S).trace"
+    python3 "$root/Scripts/bounded_run.py" --seconds 10 --label launch -- \
+        open "$app" --args "${args[@]}" --probe-microphone-delayed
+    sleep 1
+    pid="$(pgrep -x Stok)"
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        echo 'Expected exactly one Stok process for profiling.' >&2
+        exit 1
+    fi
+    python3 "$root/Scripts/bounded_run.py" --seconds 45 --label microphone-profile -- \
+        xcrun xctrace record --template 'Time Profiler' --time-limit 12s \
+        --output "$trace" --no-prompt --attach "$pid"
+    echo "Profile saved: $trace"
+    exit 0
+fi
+open "$app" --args "${args[@]}"
+sleep 2
+if ! pgrep -x Stok >/dev/null; then
+    echo 'Stok exited during startup. Check its DiagnosticReports crash log.' >&2
+    exit 1
+fi
+echo 'Stok is running.'

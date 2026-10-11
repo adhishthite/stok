@@ -1,0 +1,323 @@
+// Copyright 2026 Adhish Thite
+// SPDX-License-Identifier: Apache-2.0
+
+import Foundation
+import SQLite3
+
+// The path is immutable and each database connection stays on the serial queue.
+public final class HistoryRepository: @unchecked Sendable {
+  private let path: String
+  private let queue = DispatchQueue(
+    label: "com.adhishthite.stok.history-query", qos: .userInitiated)
+  /// Upper bound on rows one query returns. Beyond it the export path is the way to read
+  /// everything; the History window says so instead of offering a Show more that stalls.
+  public static let maxRows = 10_000
+  public init(path: String) {
+    self.path =
+      NSString(string: path.isEmpty ? "~/Library/Application Support/Stok/history.db" : path)
+      .expandingTildeInPath
+  }
+  public func entries(search: String = "", since: Date? = nil, limit: Int = 500) async throws
+    -> [HistoryEntry]
+  {
+    try await withCheckedThrowingContinuation { continuation in
+      queue.async {
+        do {
+          guard FileManager.default.fileExists(atPath: self.path) else {
+            continuation.resume(returning: [])
+            return
+          }
+          let rows = try self.withDatabase { db -> [HistoryEntry] in
+            let sql = """
+              SELECT id,ts_epoch,COALESCE(text,''),outcome,COALESCE(app_name,''),
+                CASE WHEN is_live_route=1 THEN 'Live' WHEN is_live_route=0 THEN 'Fallback' ELSE COALESCE(transport,'') END,
+                COALESCE(model,''),word_count,cost_usd,input_tokens,output_tokens,COALESCE(tokens_metered,0),
+                audio_seconds,event_queue_ms,capture_finalize_ms,first_token_ms,roundtrip_ms,inject_ms,total_ms,ready_ms,
+                COALESCE(delivery_outcome,''),COALESCE(finish_mode,''),COALESCE(error,''),
+                post_process_status,post_process_model,post_process_ms,post_process_input_tokens,
+                post_process_output_tokens,post_process_thinking_tokens,post_process_cost_usd,
+                post_process_error,post_process_app_context,COALESCE(transcription_cost_usd,cost_usd),
+                capture_start_ms,first_interim_ms
+              FROM transcriptions WHERE ts_epoch >= ? AND
+                (COALESCE(text,'') LIKE ? ESCAPE char(92) OR COALESCE(app_name,'') LIKE ? ESCAPE char(92))
+              ORDER BY ts_epoch DESC,id DESC LIMIT ?
+              """
+            let statement = try Self.prepare(db, sql)
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_double(statement, 1, since?.timeIntervalSince1970 ?? 0)
+            let term =
+              "%"
+              + search.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(
+                of: "%", with: "\\%"
+              ).replacingOccurrences(of: "_", with: "\\_") + "%"
+            Self.bind(statement, 2, term)
+            Self.bind(statement, 3, term)
+            sqlite3_bind_int(statement, 4, Int32(limit <= 0 ? -1 : min(limit, Self.maxRows)))
+            var rows: [HistoryEntry] = []
+            var status = sqlite3_step(statement)
+            while status == SQLITE_ROW {
+              rows.append(
+                HistoryEntry(
+                  id: sqlite3_column_int64(statement, 0),
+                  date: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                  text: Self.text(statement, 2), outcome: Self.text(statement, 3),
+                  app: Self.text(statement, 4), route: Self.text(statement, 5),
+                  model: Self.text(statement, 6), words: Int(sqlite3_column_int(statement, 7)),
+                  cost: Self.number(statement, 8), inputTokens: Self.integer(statement, 9),
+                  outputTokens: Self.integer(statement, 10),
+                  metered: sqlite3_column_int(statement, 11) == 1,
+                  audioSeconds: Self.number(statement, 12),
+                  eventQueueMs: Self.number(statement, 13), captureMs: Self.number(statement, 14),
+                  firstTokenMs: Self.number(statement, 15), apiMs: Self.number(statement, 16),
+                  injectionMs: Self.number(statement, 17), totalMs: Self.number(statement, 18),
+                  readyMs: Self.number(statement, 19), delivery: Self.text(statement, 20),
+                  finishMode: Self.text(statement, 21), error: Self.text(statement, 22),
+                  postProcessing: sqlite3_column_type(statement, 23) == SQLITE_NULL
+                    ? nil
+                    : PostProcessingMetrics(
+                      status: Self.text(statement, 23),
+                      model: sqlite3_column_type(statement, 24) == SQLITE_NULL
+                        ? nil : Self.text(statement, 24),
+                      latencyMs: Self.number(statement, 25),
+                      inputTokens: Self.integer(statement, 26),
+                      outputTokens: Self.integer(statement, 27),
+                      thinkingTokens: Self.integer(statement, 28),
+                      costUSD: Self.number(statement, 29),
+                      errorCode: sqlite3_column_type(statement, 30) == SQLITE_NULL
+                        ? nil : Self.text(statement, 30),
+                      appContextUsed: sqlite3_column_int(statement, 31) == 1),
+                  transcriptionCost: Self.number(statement, 32),
+                  captureStartMs: Self.number(statement, 33),
+                  firstInterimMs: Self.number(statement, 34)))
+              status = sqlite3_step(statement)
+            }
+            guard status == SQLITE_DONE else { throw HistoryRepositoryError.queryFailed }
+            return rows
+          }
+          continuation.resume(returning: rows)
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+  /// Total rows matching the same filter as `entries`, ignoring `limit` (audit F31).
+  /// HistoryViewStore uses this to show "Showing N of M" instead of silently
+  /// capping the table at the default row limit.
+  public func count(search: String = "", since: Date? = nil) async throws -> Int {
+    try await withCheckedThrowingContinuation { continuation in
+      queue.async {
+        do {
+          guard FileManager.default.fileExists(atPath: self.path) else {
+            continuation.resume(returning: 0)
+            return
+          }
+          let count = try self.withDatabase { db -> Int in
+            let sql = """
+              SELECT COUNT(*) FROM transcriptions WHERE ts_epoch >= ? AND
+                (COALESCE(text,'') LIKE ? ESCAPE char(92) OR COALESCE(app_name,'') LIKE ? ESCAPE char(92))
+              """
+            let statement = try Self.prepare(db, sql)
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_double(statement, 1, since?.timeIntervalSince1970 ?? 0)
+            let term =
+              "%"
+              + search.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(
+                of: "%", with: "\\%"
+              ).replacingOccurrences(of: "_", with: "\\_") + "%"
+            Self.bind(statement, 2, term)
+            Self.bind(statement, 3, term)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+              throw HistoryRepositoryError.queryFailed
+            }
+            return Int(sqlite3_column_int64(statement, 0))
+          }
+          continuation.resume(returning: count)
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+  public func statistics(since: Date) async throws -> HistoryStatistics {
+    try await withCheckedThrowingContinuation { continuation in
+      queue.async {
+        do {
+          guard FileManager.default.fileExists(atPath: self.path) else {
+            continuation.resume(returning: .empty)
+            return
+          }
+          let result = try self.withDatabase { db -> HistoryStatistics in
+            let stmt = try Self.prepare(
+              db,
+              "SELECT word_count,COALESCE(cost_usd,transcription_cost_usd),total_ms,post_process_status,post_process_cost_usd FROM transcriptions WHERE outcome='success' AND ts_epoch >= ?"
+            )
+            defer { sqlite3_finalize(stmt) }
+            sqlite3_bind_double(stmt, 1, since.timeIntervalSince1970)
+            var count = 0
+            var words = 0
+            var cost = 0.0
+            var unpricedCleanupCount = 0
+            var latencies: [Double] = []
+            var status = sqlite3_step(stmt)
+            while status == SQLITE_ROW {
+              count += 1
+              words += Int(sqlite3_column_int(stmt, 0))
+              cost += Self.number(stmt, 1) ?? 0
+              let cleanup = Self.text(stmt, 3)
+              if !cleanup.isEmpty, cleanup != "off", cleanup != "not_needed", cleanup != "skipped",
+                Self.number(stmt, 4) == nil
+              {
+                unpricedCleanupCount += 1
+              }
+              if let value = Self.number(stmt, 2), value.isFinite { latencies.append(value) }
+              status = sqlite3_step(stmt)
+            }
+            guard status == SQLITE_DONE else { throw HistoryRepositoryError.queryFailed }
+            latencies.sort()
+            return HistoryStatistics(
+              count: count, words: words, cost: cost, medianMs: Self.percentile(latencies, 0.5),
+              p95Ms: Self.percentile(latencies, 0.95), unpricedCleanupCount: unpricedCleanupCount)
+          }
+          continuation.resume(returning: result)
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+  public func delete(ids: Set<Int64>) async throws {
+    guard !ids.isEmpty else { return }
+    try await mutate { db in
+      guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+        throw HistoryRepositoryError.queryFailed
+      }
+      do {
+        let stmt = try Self.prepare(db, "DELETE FROM transcriptions WHERE id=?")
+        defer { sqlite3_finalize(stmt) }
+        for id in ids {
+          sqlite3_reset(stmt)
+          sqlite3_bind_int64(stmt, 1, id)
+          guard sqlite3_step(stmt) == SQLITE_DONE else { throw HistoryRepositoryError.queryFailed }
+        }
+        guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+          throw HistoryRepositoryError.queryFailed
+        }
+      } catch {
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        throw error
+      }
+    }
+  }
+  public func prune(before cutoff: Date) async throws {
+    try await mutate { db in
+      guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+        throw HistoryRepositoryError.queryFailed
+      }
+      do {
+        // connection_events is additive: a database this process opened before
+        // HistoryStore ever created it (or wrote by an older build) may not have the table
+        // yet. Skip it rather than fail the whole prune.
+        for table in ["transcriptions", "corrections", "connection_events"] {
+          guard Self.tableExists(table, in: db) else { continue }
+          let statement = try Self.prepare(db, "DELETE FROM \(table) WHERE ts_epoch < ?")
+          defer { sqlite3_finalize(statement) }
+          sqlite3_bind_double(statement, 1, cutoff.timeIntervalSince1970)
+          guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw HistoryRepositoryError.queryFailed
+          }
+        }
+        guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+          throw HistoryRepositoryError.queryFailed
+        }
+      } catch {
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        throw error
+      }
+    }
+  }
+  public func clear() async throws {
+    try await mutate { db in
+      var sql = "BEGIN IMMEDIATE; DELETE FROM transcriptions; DELETE FROM corrections;"
+      // Same additive-table tolerance as prune: a pre-item-D database has no
+      // connection_events table to clear.
+      if Self.tableExists("connection_events", in: db) {
+        sql += " DELETE FROM connection_events;"
+      }
+      sql += " COMMIT;"
+      guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else {
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        throw HistoryRepositoryError.queryFailed
+      }
+    }
+  }
+  private func mutate(_ body: @escaping (OpaquePointer) throws -> Void) async throws {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      queue.async {
+        do {
+          guard FileManager.default.fileExists(atPath: self.path) else {
+            continuation.resume()
+            return
+          }
+          try self.withDatabase(body)
+          continuation.resume()
+        } catch { continuation.resume(throwing: error) }
+      }
+    }
+  }
+  private func withDatabase<Value>(_ body: (OpaquePointer) throws -> Value) throws -> Value {
+    var db: OpaquePointer?
+    guard
+      sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+      let handle = db
+    else {
+      if let db { sqlite3_close(db) }
+      throw HistoryRepositoryError.databaseUnavailable
+    }
+    defer { sqlite3_close(handle) }
+    sqlite3_busy_timeout(handle, 2000)
+    try HistoryPostProcessingSchema.migrate(handle)
+    // No schema writes here: this path also serves entries()/count()/statistics(),
+    // the read-only History browsing paths, which must not pay for a DDL statement (or need
+    // write access) on every call. connection_events is created by HistoryStore's own
+    // migration; prune/clear tolerate it being absent via tableExists below.
+    return try body(handle)
+  }
+  private static func tableExists(_ name: String, in db: OpaquePointer) -> Bool {
+    var statement: OpaquePointer?
+    guard
+      sqlite3_prepare_v2(
+        db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", -1, &statement, nil)
+        == SQLITE_OK, let statement
+    else {
+      sqlite3_finalize(statement)
+      return false
+    }
+    defer { sqlite3_finalize(statement) }
+    bind(statement, 1, name)
+    return sqlite3_step(statement) == SQLITE_ROW
+  }
+  private static func prepare(_ db: OpaquePointer, _ sql: String) throws -> OpaquePointer {
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+      throw HistoryRepositoryError.queryFailed
+    }
+    return statement
+  }
+  private static func bind(_ stmt: OpaquePointer, _ index: Int32, _ value: String) {
+    sqlite3_bind_text(stmt, index, value, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+  }
+  private static func text(_ stmt: OpaquePointer, _ index: Int32) -> String {
+    guard let bytes = sqlite3_column_text(stmt, index) else { return "" }
+    return String(
+      decoding: UnsafeBufferPointer(start: bytes, count: Int(sqlite3_column_bytes(stmt, index))),
+      as: UTF8.self)
+  }
+  private static func number(_ stmt: OpaquePointer, _ index: Int32) -> Double? {
+    sqlite3_column_type(stmt, index) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, index)
+  }
+  private static func integer(_ stmt: OpaquePointer, _ index: Int32) -> Int? {
+    sqlite3_column_type(stmt, index) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(stmt, index))
+  }
+  private static func percentile(_ sorted: [Double], _ quantile: Double) -> Double? {
+    guard !sorted.isEmpty else { return nil }
+    let position = Double(sorted.count - 1) * quantile
+    let lower = Int(position)
+    let upper = min(sorted.count - 1, Int(position.rounded(.up)))
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - Double(lower))
+  }
+}

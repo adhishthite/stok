@@ -1,0 +1,56 @@
+name: Check release readiness
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag matching MARKETING_VERSION, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stok-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      STOK_RELEASE_TAG: ${{ inputs.tag }}
+      STOK_RELEASE_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install build tools
+        timeout-minutes: 5
+        run: |
+          brew install xcodegen actionlint uv
+          make install
+      - name: Validate workflow tooling
+        run: make check-ci
+      - name: Validate release request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 Scripts/ci/release.py preflight
+      - name: Check before loading signing credentials
+        timeout-minutes: 4
+        env:
+          STOK_BUILD_TIMEOUT_SECONDS: 180
+        run: python3 Scripts/bounded_run.py --seconds 180 --label release-check -- make check
+      - name: Local signing and publication handoff
+        run: |
+          echo 'Release checks passed. Build and stage assets locally with the Keychain workflow in CI_RELEASE.md.'
+          echo 'This workflow does not export credentials, create tags, upload assets, or publish releases.'

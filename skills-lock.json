@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "skills": {
+    "chat": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "chat/SKILL.md",
+      "computedHash": "f84f7dcd45f942ba2e2d307ec3d6495efd3cef87cd798e3355570a2118eabc5c"
+    },
+    "doc-ai": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "doc-ai/SKILL.md",
+      "computedHash": "ed2fd815c48c4f11dc39458f944fa5dd5bf829cff5b0da66e1bcbcf43f372410"
+    },
+    "dubbing": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "dubbing/SKILL.md",
+      "computedHash": "3f6d0d700e50c0f9687362dcdc32be0fb90169f857a3bcdbd345f27bbb2de2f1"
+    },
+    "sarvam-mcp": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "sarvam-mcp/SKILL.md",
+      "computedHash": "044e352e63f29f46569db478c00505bc90cf1301faa5fc6c5ef46ca79a6dda2c"
+    },
+    "speech-to-text": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "speech-to-text/SKILL.md",
+      "computedHash": "dcc8361a0c1391fa70a55304ebdde6eb9c4bf325e014d0badd046180add1c345"
+    },
+    "text-to-speech": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "text-to-speech/SKILL.md",
+      "computedHash": "05410c869bca26f1a77249b001814789d7376ffe9b48aaa0549a2e7a85e5f020"
+    },
+    "vibe-coding": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "vibe-coding/SKILL.md",
+      "computedHash": "652d8a21e0108eeb454208a268132eaefad280fac50a6f4fde8bdbff92cf2112"
+    },
+    "voice-agents": {
+      "source": "sarvamai/skills",
+      "sourceType": "github",
+      "skillPath": "voice-agents/SKILL.md",
+      "computedHash": "ce304c38f42c0835f185082c07ce4a97b449ec3bd3cdef4dcc23f2ddf86ea6ca"
+    }
+  }
+}

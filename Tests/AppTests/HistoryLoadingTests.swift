@@ -1,0 +1,33 @@
+// Copyright 2026 Adhish Thite
+// SPDX-License-Identifier: Apache-2.0
+
+import XCTest
+
+@testable import Stok
+
+@MainActor
+final class HistoryLoadingTests: XCTestCase {
+  func testOpeningHistoryDoesNotPresentEmptyStateWhileQueryIsPending() {
+    let store = HistoryViewStore()
+    store.configure(
+      path: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path)
+    store.visible = true
+
+    store.reload()
+
+    XCTAssertTrue(store.loading)
+    XCTAssertTrue(store.entries.isEmpty)
+  }
+
+  func testSearchDoesNotPresentNoMatchesDuringDebounce() {
+    let store = HistoryViewStore()
+    store.configure(
+      path: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path)
+    store.visible = true
+
+    store.search = "synthetic search"
+
+    XCTAssertTrue(store.loading)
+    XCTAssertTrue(store.entries.isEmpty)
+  }
+}

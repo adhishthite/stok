@@ -1,0 +1,1146 @@
+// Copyright 2026 Adhish Thite
+// SPDX-License-Identifier: Apache-2.0
+
+import AppKit
+import ApplicationServices
+import QuartzCore
+
+final class FloatingHUD: NSObject {
+  let notchPanel: NSPanel
+  private let notchGlowView: AuraView
+
+  // The pill lives on a STATIC panel sized to its maximum footprint; nothing ever animates
+  // at the window level. All motion is view geometry inside it - GPU-composited and spring
+  // driven. The old animator().setFrame pipeline animated the window itself through the
+  // window server, and that cadence was the ceiling on smoothness.
+  let hostPanel: NSPanel
+  let hostView: NSView
+  let pillWrapper: NSView  // shadow carrier: masksToBounds off, shadowPath capsule
+  private let pillClip: NSView  // continuous-corner capsule clip for the content
+  private let backplateView: BackplateView
+  private let materialView: NSVisualEffectView  // pill-mode only: wallpaper shows through
+  private let orbIcon: OrbView
+  private let headerLabel: NSTextField
+  private let transcriptLabel: NSTextField
+  // Hold-to-lock rim: a stroke tracing the capsule clockwise from 12 o'clock that closes
+  // at the instant the hold locks. Topmost subview of pillClip so the capsule mask trims it.
+  private let lockRingView: HoldRingView
+
+  var hideWorkItem: DispatchWorkItem?
+
+  // Main-thread-only lock state. lockAfter is the hold length that locks (nil = no ring);
+  // listenStart anchors the ring's clock. On lock, lockPulse runs 1→0: the closed rim
+  // flares, then decays to a faint resting ring that persists for as long as the lock does.
+  private var lockAfter: TimeInterval?
+  private var listenStart: CFTimeInterval = 0
+  private var locked = false
+  private var lockPulse = SpringChannel(value: 0.0, target: 0.0, stiffness: 90, dampingRatio: 1.0)
+  // The lock hint owns the transcript line briefly; live words arriving inside that window
+  // are held and rendered once it lapses, so the hint is never wiped mid-read.
+  private var lockHintUntil: CFTimeInterval = 0
+  private var deferredLiveText: String?
+  private var lockRingSize: CGSize = .zero
+  private static let lockHint = "Hands free. Press the key to finish."
+
+  private var notchInfo: NotchGeometry
+  private var screenFrame: NSRect
+  // Display the HUD is laid out on; nil = wherever NSScreen.main says. Main-thread-only.
+  private var currentDisplayID: CGDirectDisplayID?
+
+  // Presence 0→1 drives travel, alpha and shadow; width is in points. Main-thread-only,
+  // like every other HUD member. Exit retunes presence stiffer (700) for a brisk retreat;
+  // showListening restores the entrance tuning.
+  var presence = SpringChannel(value: 0.0, target: 0.0, stiffness: 420, dampingRatio: 1.0)
+  var widthSpring = SpringChannel(
+    value: HUDMetrics.minPillWidth, target: HUDMetrics.minPillWidth, stiffness: 380,
+    dampingRatio: 0.86, epsilon: 0.05)
+  var shownTarget = false
+
+  private var lastFrameState: FrameState?
+
+  // Entrance animation; set once at startup from config. "slide" is the shipped default.
+  var revealStyle: String = "slide"
+
+  // Ambient mote emission under the notch while listening; forwarded to the aura view.
+  var particlesEnabled: Bool = true {
+    didSet { notchGlowView.particlesEnabled = particlesEnabled }
+  }
+
+  // Screen-share privacy: the pill never renders dictated words. It stays on screen with
+  // a single state word, because hiding it entirely left success and failure looking the
+  // same. Nothing dictated is drawn in this mode.
+  var privacyMode: Bool = false {
+    didSet {
+      guard oldValue != privacyMode else { return }
+      lastFrameState = nil
+      if privacyMode {
+        // Words already on screen must go the instant the switch flips, not one frame later.
+        deferredLiveText = nil
+        setTranscript(privacyStateWord(), color: NSColor(white: 1.0, alpha: 0.85), caret: false)
+      }
+      guard shownTarget else { return }
+      applyFrame()
+      if reduceMotion { hostView.alphaValue = 1 }
+      hostPanel.orderFrontRegardless()
+    }
+  }
+
+  // The word privacy mode shows in place of the transcript. Enough to know what the HUD
+  // is doing, never a dictated word.
+  private func privacyStateWord() -> String {
+    switch notchGlowView.state {
+    case .listening: return "Listening"
+    case .processing: return "Finishing…"
+    case .success: return "Done"
+    case .error: return lastErrorWord
+    case .idle: return ""
+    }
+  }
+
+  // State word for the last failure in privacy mode. Only outcomes that are not errors
+  // keep their own word ("Copied", "Cancelled"); every real failure reads "Error", because
+  // a leading word like "No" or "Microphone" says nothing on its own.
+  private var lastErrorWord = "Error"
+
+  static func shortErrorWord(_ message: String) -> String {
+    let first = message.split(whereSeparator: { $0 == " " || $0 == "\n" }).first.map(String.init)
+    let trimmed = first?.trimmingCharacters(in: CharacterSet.alphanumerics.inverted) ?? ""
+    return ["Copied", "Cancelled"].contains(trimmed) ? trimmed : "Error"
+  }
+
+  // The hotkey shape decides the listening placeholder: in toggle mode nothing is held,
+  // so "release" would be a lie. Set from EngineConfiguration on every settings change.
+  var hotkeyMode: String = "push_to_talk"
+  var shortcutLabel: String = "Fn"
+
+  // Translate mode streams partials in the spoken language and pastes English. The
+  // eyebrow says so up front, so the switch of language at paste time is expected.
+  var translating = false
+
+  private var listeningHeader: String { translating ? "Listening · English" : "Listening" }
+  private var finishingHeader: String { translating ? "Translating" : "Finishing" }
+
+  var listeningPlaceholder: String {
+    hotkeyMode == "toggle"
+      ? "Speak, then press \(shortcutLabel) to paste" : "Speak, then release to paste"
+  }
+
+  // CADisplayLink on macOS 14+ (stored as AnyObject so the property needs no availability
+  // annotation); a 60Hz timer stands in on older systems.
+  private var displayLink: AnyObject?
+  private var fallbackTimer: Timer?
+  private var lastTickTime: CFTimeInterval = 0
+  private let motionReduced: () -> Bool
+  private let contrastIncreased: () -> Bool
+  private let accessibilityNotifications: NotificationCenter
+  private var accessibilityObserver: NSObjectProtocol?
+  private var lastReducedMotion: Bool
+
+  var isTicking: Bool { displayLink != nil || fallbackTimer != nil }
+
+  // Everything is assembled in locals first: NSObject subclasses may not touch properties
+  // of already-assigned stored objects before super.init(), only initialize them.
+  override convenience init() {
+    self.init(reduceMotion: { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion })
+  }
+
+  init(
+    reduceMotion: @escaping () -> Bool,
+    accessibilityNotifications: NotificationCenter = NSWorkspace.shared.notificationCenter,
+    increaseContrast: @escaping () -> Bool = {
+      NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+    }
+  ) {
+    motionReduced = reduceMotion
+    contrastIncreased = increaseContrast
+    self.accessibilityNotifications = accessibilityNotifications
+    lastReducedMotion = reduceMotion()
+    let screen = NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+    let screenFrame = screen.frame
+    let notchInfo = NotchGeometry.detect(screen: screen)
+
+    // 1. Notch glow overlay. The panel stays at alpha 1.0 forever; fades happen on the
+    // VIEW's alpha - a layer write per frame, not a window-server call.
+    let padding: CGFloat = 50.0
+    let glowWidth = notchInfo.rect.width + padding * 2
+    let glowHeight = notchInfo.rect.height + padding + 44.0
+    let glowX = notchInfo.rect.minX - padding
+    let glowY = screenFrame.maxY - glowHeight
+
+    let notchPanel = HUDPanel(
+      contentRect: NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight),
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    notchPanel.level = .screenSaver
+    notchPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+    notchPanel.isOpaque = false
+    notchPanel.backgroundColor = .clear
+    notchPanel.hasShadow = false
+    notchPanel.ignoresMouseEvents = true
+    notchPanel.alphaValue = 1.0
+
+    let notchGlowView = AuraView(frame: NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight))
+    notchGlowView.notchRect = notchInfo.rect
+    notchGlowView.alphaValue = 0.0
+    notchPanel.contentView = notchGlowView
+
+    // 2. Static host panel for the pill, at maximum footprint, top edge at screen top.
+    let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
+    let hostPanel = HUDPanel(
+      contentRect: NSRect(
+        x: screenFrame.midX - host.width / 2.0,
+        y: screenFrame.maxY - host.height,
+        width: host.width, height: host.height),
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    hostPanel.level = .floating
+    hostPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+    hostPanel.isOpaque = false
+    hostPanel.backgroundColor = .clear
+    // The window shadow would be recomputed from content on every frame of a shaped,
+    // moving pill; a layer shadow with an explicit capsule path composites instead.
+    hostPanel.hasShadow = false
+    hostPanel.ignoresMouseEvents = true
+    hostPanel.alphaValue = 1.0
+
+    let hostView = NSView(frame: NSRect(x: 0, y: 0, width: host.width, height: host.height))
+    hostView.wantsLayer = true
+    hostView.alphaValue = 0.0
+
+    let pillWrapper = NSView(
+      frame: NSRect(
+        x: (host.width - HUDMetrics.minPillWidth) / 2.0,
+        y: host.height - notchInfo.rect.height - HUDMetrics.pillGap - HUDMetrics.pillHeight,
+        width: HUDMetrics.minPillWidth, height: HUDMetrics.pillHeight))
+    pillWrapper.wantsLayer = true
+    pillWrapper.layer?.masksToBounds = false
+    pillWrapper.layer?.shadowColor = NSColor.black.cgColor
+    pillWrapper.layer?.shadowRadius = 16.0
+    pillWrapper.layer?.shadowOffset = CGSize(width: 0, height: -8)
+    pillWrapper.layer?.shadowOpacity = 0.0
+
+    // Hardware-black container. The pill reads as a piece of the notch itself - opaque
+    // near-black like the bezel glass, not a translucent overlay - so no blur material.
+    let pillClip = NSView(frame: pillWrapper.bounds)
+    pillClip.wantsLayer = true
+    pillClip.layer?.cornerRadius = HUDMetrics.pillHeight / 2.0
+    if #available(macOS 10.15, *) {
+      pillClip.layer?.cornerCurve = .continuous
+    }
+    pillClip.layer?.masksToBounds = true
+
+    // No-notch displays have no bezel for a hardware-black slab to continue, and on a
+    // light wallpaper the slab reads as a hard-edged black block. There the pill is a
+    // dark translucent material with the wallpaper blurred through it; hidden on notch
+    // displays so the bezel illusion stays intact.
+    let materialView = NSVisualEffectView(frame: pillClip.bounds)
+    materialView.material = .hudWindow
+    materialView.blendingMode = .behindWindow
+    materialView.state = .active
+    materialView.appearance = NSAppearance(named: .darkAqua)
+    materialView.isHidden = true
+    pillClip.addSubview(materialView)
+
+    let backplateView = BackplateView(frame: pillClip.bounds)
+    pillClip.addSubview(backplateView)
+
+    // The voice orb owns the left of the pill; its halo lights the plate around it.
+    let orbIcon = OrbView(
+      frame: NSRect(x: 0, y: 0, width: HUDMetrics.orbWidth, height: HUDMetrics.pillHeight))
+    pillClip.addSubview(orbIcon)
+
+    // Eyebrow state label beside the glyph: a single uppercase state word.
+    let headerLabel = NSTextField(labelWithString: "")
+    headerLabel.frame = NSRect(x: HUDMetrics.textInset, y: 31, width: 260, height: 16)
+    pillClip.addSubview(headerLabel)
+
+    // Live transcript or status line (bottom row).
+    let transcriptLabel = NSTextField(labelWithString: "")
+    transcriptLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .regular)
+    transcriptLabel.frame = NSRect(
+      x: HUDMetrics.textInset, y: 9, width: HUDMetrics.minPillWidth - HUDMetrics.textInset - 18,
+      height: 20)
+    transcriptLabel.lineBreakMode = .byTruncatingTail
+    pillClip.addSubview(transcriptLabel)
+
+    let lockRingView = HoldRingView(frame: pillClip.bounds)
+    pillClip.addSubview(lockRingView)
+
+    pillWrapper.addSubview(pillClip)
+    hostView.addSubview(pillWrapper)
+    hostPanel.contentView = hostView
+
+    self.screenFrame = screenFrame
+    self.notchInfo = notchInfo
+    self.notchPanel = notchPanel
+    self.notchGlowView = notchGlowView
+    self.hostPanel = hostPanel
+    self.hostView = hostView
+    self.pillWrapper = pillWrapper
+    self.pillClip = pillClip
+    self.backplateView = backplateView
+    self.materialView = materialView
+    self.orbIcon = orbIcon
+    self.headerLabel = headerLabel
+    self.transcriptLabel = transcriptLabel
+    self.lockRingView = lockRingView
+
+    super.init()
+
+    // Re-run screen-dependent layout whenever the display configuration changes
+    // (monitor plugged/unplugged, resolution change, etc.) so the notch aura and
+    // pill don't stay pinned to stale geometry.
+    NotificationCenter.default.addObserver(
+      forName: NSApplication.didChangeScreenParametersNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.applyScreenLayout()
+    }
+
+    accessibilityObserver = accessibilityNotifications.addObserver(
+      forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+      object: nil, queue: .main
+    ) { [weak self] _ in
+      self?.accessibilityDisplayOptionsChanged()
+    }
+
+    // On non-notch displays the aura panel must wrap the pill instead of a phantom
+    // cutout; applyScreenLayout holds that branch, so run it once at startup.
+    orbIcon.reduceMotion = lastReducedMotion
+    notchGlowView.reduceMotion = lastReducedMotion
+    applyScreenLayout()
+  }
+
+  deinit {
+    if #available(macOS 14.0, *), let link = displayLink as? CADisplayLink { link.invalidate() }
+    fallbackTimer?.invalidate()
+    if let accessibilityObserver {
+      accessibilityNotifications.removeObserver(accessibilityObserver)
+    }
+  }
+
+  private func accessibilityDisplayOptionsChanged() {
+    // Increase Contrast rides the same notification as Reduce Motion, and it can change
+    // on its own, so it is handled before the reduced-motion early exit.
+    applyContrastSurface()
+    let reduced = reduceMotion
+    guard reduced != lastReducedMotion else { return }
+    lastReducedMotion = reduced
+    orbIcon.reduceMotion = reduced
+    notchGlowView.reduceMotion = reduced
+    lastFrameState = nil
+    hostView.layer?.removeAllAnimations()
+    notchGlowView.layer?.removeAllAnimations()
+    headerLabel.layer?.removeAllAnimations()
+    transcriptLabel.layer?.removeAllAnimations()
+    if reduced {
+      stopTick()
+      presence.snap()
+      widthSpring.snap()
+      lockPulse.snap()
+      notchGlowView.stopMotion()
+      // No display tick remains to release the temporary lock hint.
+      lockHintUntil = 0
+      if locked {
+        updateLockRing(now: CACurrentMediaTime(), dt: 0)
+      } else {
+        lockRingView.stopSweep()
+        lockRingView.progress = 0
+        lockRingView.strength = 0
+      }
+      applyFrame()
+      hostView.alphaValue = shownTarget ? 1 : 0
+      notchGlowView.alphaValue = shownTarget ? 1 : 0
+      if !shownTarget {
+        hostPanel.orderOut(nil)
+        notchPanel.orderOut(nil)
+      }
+    } else {
+      applyFrame()
+      startSweep()
+      if shownTarget || !presence.settled || !widthSpring.settled { startTick() }
+    }
+  }
+
+  private var reduceMotion: Bool {
+    motionReduced()
+  }
+
+  // Recomputes screenFrame, notchInfo, and repositions the panels - the same geometry
+  // math used to place them in init().
+  // Re-anchors both panels on `screen` if it differs from the current one. Called at
+  // key-down before showListening; a change mid-exit (quick re-press after moving to the
+  // other display) relayouts while the pill is near-collapsed, so no visible jump.
+  func retarget(to screen: NSScreen) {
+    let id = FocusScreenResolver.displayID(of: screen)
+    guard id != currentDisplayID else { return }
+    currentDisplayID = id
+    applyScreenLayout()
+    if #available(macOS 10.15, *) {
+      HUDLog.info(
+        "HUD",
+        "Following focus to \(screen.localizedName)\(notchInfo.hasPhysicalNotch ? " (notch)" : " (pill)")."
+      )
+    }
+  }
+
+  // The display picked by retarget while it's still attached; the display-config
+  // notification drops back to NSScreen.main when it has been unplugged.
+  private func layoutScreen() -> NSScreen {
+    if let id = currentDisplayID,
+      let s = NSScreen.screens.first(where: { FocusScreenResolver.displayID(of: $0) == id })
+    {
+      return s
+    }
+    currentDisplayID = nil
+    return NSScreen.main ?? NSScreen.screens.first ?? NSScreen()
+  }
+
+  private func applyScreenLayout() {
+    lastFrameState = nil
+    let screen = layoutScreen()
+    self.screenFrame = screen.frame
+    self.notchInfo = NotchGeometry.detect(screen: screen)
+
+    let host = HUDMetrics.hostSize(notchHeight: notchInfo.rect.height)
+    let pillTopScreen = screenFrame.maxY - notchInfo.rect.height - HUDMetrics.pillGap
+    hostPanel.setFrame(
+      NSRect(
+        x: screenFrame.midX - host.width / 2.0,
+        y: screenFrame.maxY - host.height,
+        width: host.width, height: host.height),
+      display: true)
+    hostView.frame = NSRect(x: 0, y: 0, width: host.width, height: host.height)
+
+    if notchInfo.hasPhysicalNotch {
+      // Aura panel hugs the hardware notch, with room below for the light spill.
+      let padding: CGFloat = 50.0
+      let glowWidth = notchInfo.rect.width + padding * 2
+      let glowHeight = notchInfo.rect.height + padding + 44.0
+      let glowX = notchInfo.rect.minX - padding
+      let glowY = screenFrame.maxY - glowHeight
+      notchPanel.setFrame(
+        NSRect(x: glowX, y: glowY, width: glowWidth, height: glowHeight), display: true)
+      notchGlowView.frame = NSRect(x: 0, y: 0, width: glowWidth, height: glowHeight)
+      notchGlowView.notchRect = notchInfo.rect
+      notchGlowView.pillMode = false
+    } else {
+      // No hardware notch: the halo wraps the pill. The panel is sized to the pill's
+      // MAXIMUM footprint so width changes never need a panel reframe. Margin must
+      // exceed the halo's worst-case reach (the flank spread pass in drawPillAura:
+      // ~16 dilation + 8 drop + 7 half-stroke + 44 blur = ~75px) or the fade gets a
+      // hard cutoff.
+      let margin: CGFloat = 88.0
+      let auraWidth = HUDMetrics.maxPillWidth + margin * 2
+      let auraHeight = HUDMetrics.pillHeight + margin * 2
+      let auraX = screenFrame.midX - auraWidth / 2.0
+      let auraY = pillTopScreen - HUDMetrics.pillHeight - margin
+      notchPanel.setFrame(
+        NSRect(x: auraX, y: auraY, width: auraWidth, height: auraHeight), display: true)
+      notchGlowView.frame = NSRect(x: 0, y: 0, width: auraWidth, height: auraHeight)
+      notchGlowView.pillMode = true
+    }
+    // The aura's capsule is a circular CGPath; a continuous-curve clip on the pill
+    // diverges from it along the end caps and the rim visibly parts from the edge.
+    // Match geometries in pill mode; the notch keeps Apple's continuous corners.
+    if #available(macOS 10.15, *) {
+      let curve: CALayerCornerCurve = notchInfo.hasPhysicalNotch ? .continuous : .circular
+      pillClip.layer?.cornerCurve = curve
+      backplateView.layer?.cornerCurve = curve
+    }
+    backplateView.specularRim = notchInfo.hasPhysicalNotch
+    applyContrastSurface()
+    notchGlowView.needsDisplay = true
+    applyFrame()
+  }
+
+  // Pill mode has no bezel behind it, so its surface was translucent enough that the
+  // 9 pt header and the dim placeholder fell under readable contrast on a light
+  // wallpaper. The surface carries the fix; notch mode keeps its hardware-black look.
+  // Increase Contrast goes all the way to an opaque plate and drops the blur material.
+  private func applyContrastSurface() {
+    let opaque = contrastIncreased()
+    let base: CGFloat = opaque ? 1.0 : (notchInfo.hasPhysicalNotch ? 0.97 : 0.80)
+    materialView.isHidden = notchInfo.hasPhysicalNotch || opaque
+    guard backplateView.baseAlpha != base else { return }
+    backplateView.baseAlpha = base
+  }
+
+  // MARK: Display tick
+
+  private func startTick() {
+    guard displayLink == nil && fallbackTimer == nil else { return }
+    lastTickTime = CACurrentMediaTime()
+    if #available(macOS 14.0, *) {
+      let link = hostView.displayLink(
+        target: DisplayLinkTarget(hud: self), selector: #selector(DisplayLinkTarget.frame(_:)))
+      link.add(to: .main, forMode: .common)
+      displayLink = link
+    } else {
+      let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) {
+        [weak self] _ in
+        self?.tick()
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      fallbackTimer = timer
+    }
+  }
+
+  func stopTick() {
+    if #available(macOS 14.0, *), let link = displayLink as? CADisplayLink {
+      link.invalidate()
+    }
+    displayLink = nil
+    fallbackTimer?.invalidate()
+    fallbackTimer = nil
+  }
+
+  func displayLinkFired() {
+    tick()
+  }
+
+  private func tick() {
+    let now = CACurrentMediaTime()
+    let dt = CGFloat(min(max(now - lastTickTime, 0.0), 1.0 / 20.0))
+    lastTickTime = now
+    guard dt > 0 else { return }
+
+    let continuous = advanceAnimation(dt: dt)
+
+    if presence.settled && widthSpring.settled {
+      if !shownTarget && presence.target == 0 {
+        hostPanel.orderOut(nil)
+        notchPanel.orderOut(nil)
+        stopTick()
+      } else if !continuous {
+        stopTick()
+      }
+    }
+  }
+
+  // One display-link frame of HUD motion, in a single transaction with implicit actions
+  // off. Ambient motion (the orb's drift, the aura's colour cycle, the hold sweep) runs in
+  // the render server, so a frame only steps springs that are still travelling. Returns
+  // whether anything still needs frames. Internal so the frame-cost test drives this path.
+  @discardableResult
+  func advanceAnimation(dt: CGFloat) -> Bool {
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    defer { CATransaction.commit() }
+    presence.step(dt: dt)
+    widthSpring.step(dt: dt)
+    applyFrame()
+    updateLockRing(now: CACurrentMediaTime(), dt: dt)
+    if !orbIcon.settled { orbIcon.advance(dt: dt) }
+    return shownTarget
+      && (!orbIcon.settled || (locked && !lockPulse.atRest) || deferredLiveText != nil)
+  }
+
+  // A new level, a deferred line, or a state change can wake a stopped display link.
+  private func wakeIfNeeded() {
+    guard shownTarget, !reduceMotion else { return }
+    startTick()
+  }
+
+  // Lays out the pill for the CURRENT spring values. Runs every animation frame (and once
+  // after any instant reduced-motion or screen-change update); AppKit skips repaints for
+  // frames set to their existing values, so settled ticks cost nothing.
+  func applyFrame() {
+    let p = max(0.0, presence.value)
+    let w = min(max(widthSpring.value, HUDMetrics.minPillWidth), HUDMetrics.maxPillWidth)
+    let hostBounds = hostView.bounds
+    let state = FrameState(
+      presence: p, width: w, bounds: hostBounds,
+      notchHeight: notchInfo.rect.height, physicalNotch: notchInfo.hasPhysicalNotch,
+      style: revealStyle, privacy: privacyMode, reducedMotion: reduceMotion)
+    guard state != lastFrameState else { return }
+    lastFrameState = state
+    let pillTop = hostBounds.height - notchInfo.rect.height - HUDMetrics.pillGap
+
+    // Each reveal style is a pure mapping from presence to geometry, so the SAME spring
+    // handles entrance, exit and mid-flight redirection; overshoot bounces are the
+    // spring's own physics (damping ratio per style), never a second animation stage.
+    var rect: NSRect
+    var radius: CGFloat
+    // Morph fades CONTENT late instead of the surface: the membrane pretends to be the
+    // notch, and a translucent notch breaks the illusion. Other styles fade the whole
+    // surface and keep content at full alpha.
+    var contentAlpha: CGFloat = 1.0
+    var surfaceAlpha = max(0.0, min(1.0, p / 0.65))
+
+    switch revealStyle {
+    case "morph" where notchInfo.hasPhysicalNotch:
+      // Membrane: phase A stays glued to the screen top (starting entirely inside the
+      // notch cutout, i.e. invisible) while the bottom edge and width stretch to the
+      // pill's; phase B detaches - the top edge peels off the notch and travels down
+      // to the pill's resting top, opening the aura gap. Spring overshoot past p=1
+      // squashes the just-detached droplet by a few percent before it settles.
+      // Mapping continuity at the split and radius validity are Python-verified.
+      let hostTop = hostBounds.height
+      let notchBottom = hostTop - notchInfo.rect.height
+      let pillBottom = pillTop - HUDMetrics.pillHeight
+      let split: CGFloat = 0.55
+      if p < split {
+        let t = p / split
+        let bottom = notchBottom + (pillBottom - notchBottom) * t
+        let pw = notchInfo.rect.width + (w - notchInfo.rect.width) * t
+        rect = NSRect(
+          x: (hostBounds.width - pw) / 2.0, y: bottom, width: pw, height: hostTop - bottom)
+        radius = 14.0 + (HUDMetrics.pillHeight / 2.0 - 14.0) * t
+      } else {
+        let t = (p - split) / (1.0 - split)
+        let top = hostTop + (pillTop - hostTop) * t
+        rect = NSRect(
+          x: (hostBounds.width - w) / 2.0, y: pillBottom, width: w, height: top - pillBottom)
+        radius = HUDMetrics.pillHeight / 2.0
+      }
+      radius = min(radius, rect.height / 2.0)
+      contentAlpha = max(0.0, min(1.0, (p - 0.7) / 0.3))
+      surfaceAlpha = min(1.0, p / 0.12)
+
+    default:
+      var pw = w
+      var ph = HUDMetrics.pillHeight
+      var lift: CGFloat = 0.0
+      switch revealStyle {
+      case "drift":
+        lift = 4.0 * (1.0 - p)
+      case "bloom":
+        let s = 0.88 + 0.12 * p
+        pw = w * s
+        ph = HUDMetrics.pillHeight * s
+      case "unfurl":
+        ph = HUDMetrics.pillHeight * (0.70 + 0.30 * p)
+      default:
+        // "slide" - also the fallback for unknown styles and for morph on displays
+        // with no physical notch to emerge from.
+        lift = 10.0 * (1.0 - p)
+      }
+      // Top edge pinned: overshoot expressed as height/size with the top fixed can
+      // never open a gap between the pill and the notch above it.
+      rect = NSRect(x: (hostBounds.width - pw) / 2.0, y: pillTop - ph + lift, width: pw, height: ph)
+      radius = ph / 2.0
+    }
+
+    let pw = rect.width
+    let ph = rect.height
+    pillWrapper.frame = rect
+    pillClip.frame = pillWrapper.bounds
+    pillClip.layer?.cornerRadius = radius
+    lockRingView.frame = pillClip.bounds
+    if lockRingSize != pillClip.bounds.size {
+      lockRingSize = pillClip.bounds.size
+      lockRingView.path = Self.lockRingPath(in: pillClip.bounds, cornerRadius: radius, inset: 3.0)
+    }
+    materialView.frame = pillClip.bounds
+    backplateView.frame = pillClip.bounds
+    // Content is top-anchored so unfurl and morph reveal it with the moving top edge.
+    orbIcon.frame = NSRect(
+      x: 0, y: ph - HUDMetrics.pillHeight, width: HUDMetrics.orbWidth, height: HUDMetrics.pillHeight
+    )
+    // Fixed-width labels: the pill's clip reveals them as it widens. A label whose width
+    // changed every frame would re-lay out and redraw its text every frame. The pill grows
+    // to fit the text (neededWidth), so at rest the clip never cuts a word.
+    let labelWidth = HUDMetrics.maxPillWidth - HUDMetrics.textInset - 18
+    let headerFrame = NSRect(x: HUDMetrics.textInset, y: ph - 25, width: 260, height: 16)
+    let transcriptFrame = NSRect(x: HUDMetrics.textInset, y: ph - 47, width: labelWidth, height: 20)
+    if headerLabel.frame != headerFrame { headerLabel.frame = headerFrame }
+    if transcriptLabel.frame != transcriptFrame { transcriptLabel.frame = transcriptFrame }
+    orbIcon.alphaValue = contentAlpha
+    headerLabel.alphaValue = contentAlpha
+    transcriptLabel.alphaValue = contentAlpha
+
+    pillWrapper.layer?.shadowPath = CGPath(
+      roundedRect: pillWrapper.bounds, cornerWidth: radius, cornerHeight: radius, transform: nil)
+
+    // Fade completes early in the travel, so arrival reads as motion, not opacity.
+    // The drop shadow grounds the pill against the bezel on notch displays; on a
+    // no-notch wallpaper it reads as a black ring between the pill and the aura's
+    // light, so the aura alone carries the grounding there.
+    let shadowStrength: CGFloat = notchInfo.hasPhysicalNotch ? 0.55 : 0.0
+    pillWrapper.layer?.shadowOpacity = Float(shadowStrength * surfaceAlpha)
+    if !reduceMotion {
+      // Privacy mode keeps the pill: it carries a state word only, so it leaks nothing
+      // while still telling success from failure.
+      hostView.alphaValue = surfaceAlpha
+      notchGlowView.alphaValue = surfaceAlpha
+    }
+    if !notchInfo.hasPhysicalNotch {
+      notchGlowView.pillSize = CGSize(width: pw, height: ph)
+    }
+  }
+
+  // MARK: Hold-to-lock rim
+
+  // The sweep before the lock is a render-server animation (HoldRingView.sweep) timed to
+  // close at the instant the app's lock timer fires, so it needs no frames. Frames only
+  // run the flare after the lock, and release live words held behind the lock hint.
+  private func updateLockRing(now: CFTimeInterval, dt: CGFloat) {
+    guard locked else { return }
+    if !lockPulse.atRest {
+      lockPulse.step(dt: dt)
+      let pulse = max(0.0, min(1.0, lockPulse.value))
+      lockRingView.color = Palette.lockedRim
+      lockRingView.progress = 1.0
+      lockRingView.lineWidth = 2.5 + 2.0 * pulse
+      lockRingView.strength = Float(0.45 + 0.55 * pulse)
+    }
+    if now >= lockHintUntil, let text = deferredLiveText {
+      deferredLiveText = nil
+      updateLiveText(text)
+    }
+  }
+
+  // Starts or resumes the hold sweep from wherever the hold is now.
+  private func startSweep() {
+    guard let lockAfter, lockAfter > 0, !locked, !reduceMotion else { return }
+    let elapsed = CACurrentMediaTime() - listenStart
+    guard elapsed < lockAfter else { return }
+    lockRingView.sweep(from: CGFloat(elapsed / lockAfter), duration: lockAfter - elapsed)
+  }
+
+  // Capsule outline starting at top-center, running clockwise (layer space is y-up, so
+  // clockwise is decreasing angle). Inset keeps the whole stroke inside the clip.
+  private static func lockRingPath(in bounds: CGRect, cornerRadius: CGFloat, inset: CGFloat)
+    -> CGPath
+  {
+    let rect = bounds.insetBy(dx: inset, dy: inset)
+    let r = max(0.0, min(cornerRadius - inset, min(rect.width, rect.height) / 2.0))
+    let path = CGMutablePath()
+    path.move(to: CGPoint(x: rect.midX, y: rect.maxY))
+    path.addLine(to: CGPoint(x: rect.maxX - r, y: rect.maxY))
+    path.addArc(
+      center: CGPoint(x: rect.maxX - r, y: rect.maxY - r), radius: r, startAngle: .pi / 2,
+      endAngle: 0, clockwise: true)
+    path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + r))
+    path.addArc(
+      center: CGPoint(x: rect.maxX - r, y: rect.minY + r), radius: r, startAngle: 0,
+      endAngle: -.pi / 2, clockwise: true)
+    path.addLine(to: CGPoint(x: rect.minX + r, y: rect.minY))
+    path.addArc(
+      center: CGPoint(x: rect.minX + r, y: rect.minY + r), radius: r, startAngle: -.pi / 2,
+      endAngle: -.pi, clockwise: true)
+    path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY - r))
+    path.addArc(
+      center: CGPoint(x: rect.minX + r, y: rect.maxY - r), radius: r, startAngle: .pi,
+      endAngle: .pi / 2, clockwise: true)
+    path.closeSubpath()
+    return path
+  }
+
+  private func clearLockRing() {
+    lockRingView.stopSweep()
+    locked = false
+    lockAfter = nil
+    deferredLiveText = nil
+    lockRingView.progress = 0.0
+    lockRingView.lineWidth = 2.5
+    lockRingView.strength = 0.0
+  }
+
+  // MARK: State typography
+
+  // Eyebrow state word: uppercase micro-type with wide tracking (the NOW PLAYING idiom).
+  private func setHeader(_ text: String, color: NSColor) {
+    // Increase Contrast lifts every eyebrow tint toward white.
+    let color = contrastIncreased() ? Palette.blend(color, .white, 0.45) : color
+    headerLabel.attributedStringValue = NSAttributedString(
+      string: text.uppercased(),
+      attributes: [
+        .font: NSFont.systemFont(ofSize: 9.0, weight: .semibold),
+        .foregroundColor: color,
+        .kern: 1.1,
+      ]
+    )
+  }
+
+  // Transcript line; caret appends a slim tinted insertion mark while text is streaming.
+  // Truncation MUST ride inside the attributed string: a label rendering attributedStringValue
+  // takes its line-break mode from the string's NSParagraphStyle, not the cell - which is why
+  // setting transcriptLabel.lineBreakMode alone never worked. While streaming, truncate the
+  // HEAD so the newest words flow into view; finished text truncates the tail as usual.
+  private func setTranscript(
+    _ text: String, color: NSColor, caret: Bool, truncation: NSLineBreakMode = .byTruncatingTail
+  ) {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineBreakMode = truncation
+    let body = NSMutableAttributedString(
+      string: text,
+      attributes: [
+        .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+        .foregroundColor: color,
+        .paragraphStyle: paragraph,
+      ]
+    )
+    if caret {
+      body.append(
+        NSAttributedString(
+          string: " ▏",
+          attributes: [
+            .font: NSFont.systemFont(ofSize: 13.5, weight: .regular),
+            .foregroundColor: Palette.saffron,
+            .paragraphStyle: paragraph,
+          ]
+        ))
+    }
+    transcriptLabel.attributedStringValue = body
+  }
+
+  // Plain transcript text with any streaming caret stripped.
+  var currentTranscriptText: String {
+    var text = transcriptLabel.attributedStringValue.string
+    if text.hasSuffix(" ▏") { text = String(text.dropLast(2)) }
+    return text
+  }
+
+  // Apple crossfades every text swap; streaming word updates are excluded - a fade per
+  // word would strobe. Discrete state changes only.
+  private func crossfadeTextChange() {
+    guard !reduceMotion else { return }
+    let fade = CATransition()
+    fade.type = .fade
+    fade.duration = 0.16
+    fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+    headerLabel.layer?.add(fade, forKey: "textFade")
+    transcriptLabel.layer?.add(fade, forKey: "textFade")
+  }
+
+  // MARK: States
+
+  // lockAfter: seconds of holding after which the app locks the turn; the rim ring sweeps
+  // over exactly that span. nil = hold-to-lock off, no ring.
+  func showListening(lockAfter: TimeInterval? = nil) {
+    hideWorkItem?.cancel()
+    shownTarget = true
+
+    clearLockRing()
+    lockPulse.value = 0.0
+    lockPulse.velocity = 0.0
+    lockPulse.target = 0.0
+    lockHintUntil = 0
+    listenStart = CACurrentMediaTime()
+    // Keep the deadline so switching Reduce Motion off can restore hold progress.
+    if let lockAfter = lockAfter, lockAfter > 0 {
+      self.lockAfter = lockAfter
+    }
+    startSweep()
+
+    notchGlowView.state = .listening
+    notchGlowView.audioLevel = 0.0
+    orbIcon.state = .listening
+    orbIcon.audioLevel = 0.0
+    setHeader(listeningHeader, color: Palette.saffronSoft)
+    // The pill appears on key-down, so the user is already holding: say what to do next.
+    setTranscript(listeningPlaceholder, color: NSColor(white: 1.0, alpha: 0.45), caret: false)
+    HUDAnnouncer.announce("Listening")
+
+    // A fresh entrance starts collapsed at rest; a retarget mid-exit keeps the spring's
+    // live position and velocity, so the pill turns around instead of restarting.
+    presence.stiffness = 420
+    presence.dampingRatio = Self.entranceDamping(for: revealStyle)
+    if presence.value < 0.05 {
+      presence.value = 0.0
+      presence.velocity = 0.0
+      widthSpring.value = HUDMetrics.minPillWidth
+      widthSpring.velocity = 0.0
+    }
+    presence.target = 1.0
+    widthSpring.target = HUDMetrics.minPillWidth
+
+    if reduceMotion {
+      presence.snap()
+      widthSpring.snap()
+      applyFrame()
+      hostView.alphaValue = 0.0
+      notchGlowView.alphaValue = 0.0
+      notchPanel.orderFrontRegardless()
+      hostPanel.orderFrontRegardless()
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.16
+        self.hostView.animator().alphaValue = 1.0
+        self.notchGlowView.animator().alphaValue = 1.0
+      }
+      return
+    }
+
+    applyFrame()
+    notchPanel.orderFrontRegardless()
+    hostPanel.orderFrontRegardless()
+    startTick()
+  }
+
+  // Slide and drift settle cleanly; bloom takes a soft overshoot; morph gets a subtle
+  // droplet squash on detach; unfurl is the bounciest.
+  private static func entranceDamping(for style: String) -> CGFloat {
+    switch style {
+    case "bloom": return 0.80
+    case "morph": return 0.75
+    case "unfurl": return 0.55
+    default: return 1.0
+    }
+  }
+
+  func updateAudioLevel(db: Double) {
+    let norm = max(0.0, min(1.0, CGFloat((db + 55.0) / 45.0)))
+    notchGlowView.audioLevel = norm
+    orbIcon.audioLevel = norm
+    if !orbIcon.settled { wakeIfNeeded() }
+  }
+
+  // The hold has locked: the closed rim flares and settles to a faint resting ring, the
+  // orb becomes a padlock, and the copy says the two things that matter now. The mic is
+  // still open, so the aura and the orb's voice swell keep their listening behaviour.
+  func showLocked() {
+    guard shownTarget else { return }
+    locked = true
+    lockAfter = nil
+    lockPulse.value = 1.0
+    lockPulse.velocity = 0.0
+    lockPulse.target = 0.0
+    lockRingView.stopSweep()
+    lockRingView.progress = 1.0
+    lockRingView.color = Palette.lockedRim
+    if reduceMotion {
+      lockRingView.lineWidth = 2.5
+      lockRingView.strength = 0.45
+    }
+    orbIcon.state = .locked
+    wakeIfNeeded()
+
+    crossfadeTextChange()
+    setHeader("Locked", color: Palette.saffronSoft)
+    setTranscript(Self.lockHint, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+    HUDAnnouncer.announce("Recording locked")
+    // Hold the hint long enough to read; streamed words queue behind it (tick flushes
+    // them). Reduced motion has no tick to flush with, so it skips the hold.
+    lockHintUntil = reduceMotion ? 0 : CACurrentMediaTime() + 1.8
+    let needed = neededWidth(forText: Self.lockHint)
+    if needed > widthSpring.target + 8.0 {
+      widthSpring.target = needed
+      if reduceMotion {
+        widthSpring.snap()
+        applyFrame()
+      } else {
+        startTick()
+      }
+    }
+  }
+
+  private func neededWidth(forText text: String) -> CGFloat {
+    let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 13.5)
+    let textWidth = (text as NSString).size(withAttributes: [.font: font]).width
+    return max(
+      HUDMetrics.minPillWidth,
+      // Text column inset, the 18 pt trailing margin, and room for the streaming caret.
+      min(HUDMetrics.maxPillWidth, textWidth + HUDMetrics.textInset + 18.0 + 22.0))
+  }
+
+  func updateLiveText(_ text: String) {
+    guard notchGlowView.state == .listening || notchGlowView.state == .processing else { return }
+    if locked && CACurrentMediaTime() < lockHintUntil {
+      deferredLiveText = text
+      wakeIfNeeded()
+      return
+    }
+
+    // Privacy mode: acknowledge that speech is landing without rendering a word of it.
+    // The pill also stays at minimum width - nothing to read, nothing to grow for.
+    if privacyMode {
+      setTranscript("Speaking…", color: NSColor(white: 1.0, alpha: 0.85), caret: true)
+      return
+    }
+
+    let clean = String(text.suffix(512)).replacingOccurrences(of: "\n", with: " ")
+      .trimmingCharacters(in: .whitespaces)
+    guard !clean.isEmpty else { return }
+
+    // While streaming, the newest words matter most: truncate at the head so the tail
+    // of the sentence is always visible, with a slim caret marking the live edge.
+    setTranscript(clean, color: .white, caret: true, truncation: .byTruncatingHead)
+
+    // Fluid auto-expansion based on text width. Once the target is at max width it can
+    // only stay there until the next showListening resets it, so stop paying the
+    // full-transcript measurement on every interim update.
+    if widthSpring.target < HUDMetrics.maxPillWidth {
+      let needed = neededWidth(forText: clean)
+      if abs(needed - widthSpring.target) > 8.0 {
+        widthSpring.target = needed
+        if reduceMotion {
+          widthSpring.snap()
+          applyFrame()
+        } else {
+          startTick()
+        }
+      }
+    }
+  }
+
+  func showStarting() {
+    hideWorkItem?.cancel()
+    if !shownTarget { showListening() }
+    clearLockRing()
+    notchGlowView.state = .processing
+    orbIcon.state = .processing
+    wakeIfNeeded()
+    setHeader("Microphone", color: Palette.periwinkle)
+    setTranscript("Getting ready…", color: .white, caret: false)
+  }
+
+  func showBusy() {
+    // Keep the current turn's text and animation; acknowledge only the refused press.
+    setHeader("Finishing previous dictation", color: Palette.periwinkle)
+  }
+
+  func showProcessing() {
+    if !shownTarget { showListening() }
+    hideWorkItem?.cancel()
+    // Words still queued behind the lock hint are the freshest transcript there is.
+    let deferred = deferredLiveText
+    clearLockRing()
+    notchGlowView.state = .processing
+    orbIcon.state = .processing
+    wakeIfNeeded()
+
+    crossfadeTextChange()
+    setHeader(finishingHeader, color: Palette.periwinkle)
+    // Keep the user's words on screen, just dimmed - wiping them for a status message
+    // makes the pill feel like it lost the dictation.
+    let existing =
+      deferred?.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+      ?? currentTranscriptText
+    if privacyMode || existing.isEmpty || existing == listeningPlaceholder
+      || existing == Self.lockHint
+    {
+      setTranscript("Finishing…", color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+    } else {
+      setTranscript(existing, color: NSColor(white: 1.0, alpha: 0.70), caret: false)
+    }
+  }
+
+  // Progress inside a long finish, for example a fallback route taking over. Only the
+  // eyebrow word changes, so the processing animation and the user's words stay put.
+  func updateProcessingStatus(_ text: String) {
+    guard notchGlowView.state == .processing else { return }
+    crossfadeTextChange()
+    setHeader(text, color: Palette.periwinkle)
+  }
+
+  func showSuccess(text: String) {
+    hideWorkItem?.cancel()
+    clearLockRing()
+    notchGlowView.state = .success
+    orbIcon.state = .success
+    wakeIfNeeded()
+    if !reduceMotion { notchGlowView.emitSuccessRipple() }
+
+    crossfadeTextChange()
+    setHeader("Done", color: Palette.success)
+    let clean = text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+    setTranscript(privacyMode || clean.isEmpty ? "Done" : clean, color: .white, caret: false)
+    HUDAnnouncer.announce("Pasted")
+
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.hide()
+    }
+    hideWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.85, execute: workItem)
+  }
+
+  // The user stopped the turn. Same shape as the error pill, but in periwinkle and
+  // with the processing glow: nothing failed, so nothing should read as red (audit F11).
+  func showCancelled() {
+    if !shownTarget { showListening() }
+    hideWorkItem?.cancel()
+    clearLockRing()
+    notchGlowView.state = .processing
+    orbIcon.state = .processing
+    wakeIfNeeded()
+
+    crossfadeTextChange()
+    setHeader("Cancelled", color: Palette.periwinkle)
+    setTranscript("Cancelled", color: NSColor(white: 1.0, alpha: 0.85), caret: false)
+    HUDAnnouncer.announce("Cancelled")
+
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.hide()
+    }
+    hideWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: workItem)
+  }
+
+  func showError(message: String) {
+    if !shownTarget { showListening() }
+    hideWorkItem?.cancel()
+    clearLockRing()
+    notchGlowView.state = .error
+    orbIcon.state = .error
+    wakeIfNeeded()
+
+    lastErrorWord = Self.shortErrorWord(message)
+
+    crossfadeTextChange()
+    setHeader("Error", color: Palette.error)
+    let shown = privacyMode ? lastErrorWord : message
+    setTranscript(shown, color: NSColor(white: 1.0, alpha: 0.85), caret: false)
+    // A recovery instruction is useless truncated, so the pill sizes itself to the
+    // message (capped at maxPillWidth by neededWidth).
+    let needed = neededWidth(forText: shown)
+    if abs(needed - widthSpring.target) > 8.0 {
+      widthSpring.target = needed
+      if reduceMotion {
+        widthSpring.snap()
+        applyFrame()
+      } else {
+        startTick()
+      }
+    }
+    HUDAnnouncer.announce(message)
+
+    let workItem = DispatchWorkItem { [weak self] in
+      self?.hide()
+    }
+    hideWorkItem = workItem
+    DispatchQueue.main.asyncAfter(
+      deadline: .now() + Self.errorLinger(for: message), execute: workItem)
+  }
+
+  // Failures that carry a recovery instruction need reading time: anything longer than
+  // 40 characters, or a copy-only notice, lingers 3 s. Short failures keep the brisk
+  // 1.4 s beat so the HUD gets out of the way.
+  static func errorLinger(for message: String) -> TimeInterval {
+    message.count > 40 || message.hasPrefix("Copied") ? 3.0 : 1.4
+  }
+
+  func hide() {
+    shownTarget = false
+    clearLockRing()
+    // Exits are brisker than entrances: stiffer spring, critically damped, retracing the
+    // entrance mapping in reverse (each style exits the way it arrived).
+    presence.stiffness = 700
+    presence.dampingRatio = 1.0
+    presence.target = 0.0
+
+    if reduceMotion {
+      NSAnimationContext.runAnimationGroup(
+        { context in
+          context.duration = 0.16
+          self.hostView.animator().alphaValue = 0.0
+          self.notchGlowView.animator().alphaValue = 0.0
+        },
+        completionHandler: {
+          if !self.shownTarget {
+            self.presence.snap()
+            self.hostPanel.orderOut(nil)
+            self.notchPanel.orderOut(nil)
+          }
+        })
+      return
+    }
+    startTick()
+  }
+}
